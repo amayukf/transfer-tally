@@ -1,5 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { normalizeVerification, type LinksEtEnvelope } from '@/utils/linksEt';
+import {
+  normalizeVerification,
+  normalizeUrlVerification,
+  type LinksEtEnvelope,
+  type LinksEtVerifyEnvelope,
+  type VerificationOutcome,
+} from '@/utils/linksEt';
 import type { VerifiedReceipt } from '@/types/transfer';
 
 // A screenshot read runs an AI detector and then a chained fetch against the
@@ -7,7 +13,12 @@ import type { VerifiedReceipt } from '@/types/transfer';
 // hosts kill the function on their plan default and the cashier sees a 504.
 export const maxDuration = 60;
 
-const LINKS_ET_ENDPOINT = 'https://links.et/api/verify-image';
+// Screenshots: the detector reads the image, then chains to the bank.
+const LINKS_ET_IMAGE_ENDPOINT = 'https://links.et/api/verify-image';
+// Full receipt URL: the only path that works for banks whose lookup URL cannot
+// be rebuilt from a screenshot (CBE, Awash, Zemen, Dashen…). Works for all 17
+// providers, so it backs both the QR decode and the paste-link fallback.
+const LINKS_ET_VERIFY_ENDPOINT = 'https://links.et/api/verify';
 
 // links.et waits for a busy bank, then fetches, then retries on another egress
 // address — an uncached receipt can hold the connection for over a minute. We
@@ -18,6 +29,7 @@ const UPSTREAM_TIMEOUT_MS = 55_000;
 const ALLOWED_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 // links.et accepts 5MB of base64 per image.
 const MAX_BASE64_CHARS = Math.ceil((5 * 1024 * 1024 * 4) / 3);
+const MAX_URL_LENGTH = 2048;
 
 /* ------------------------------------------------------------------ */
 /* In-memory per-IP sliding-window rate limiter.                       */
@@ -77,6 +89,155 @@ export type VerifyApiResponse =
       reference?: string;
     };
 
+/** Turns a normalised outcome into the small shape the browser consumes. */
+function outcomeToResponse(outcome: VerificationOutcome): NextResponse {
+  if (outcome.status === 'verified') {
+    return NextResponse.json({
+      ok: true,
+      status: 'verified',
+      receipt: outcome.receipt,
+    } satisfies VerifyApiResponse);
+  }
+
+  return NextResponse.json({
+    ok: true,
+    status: 'unverified',
+    reason: outcome.reason,
+    provider: outcome.detected?.provider,
+    reference: outcome.detected?.reference ?? undefined,
+  } satisfies VerifyApiResponse);
+}
+
+/**
+ * Maps a links.et refusal (or a transport error) to a client-facing status.
+ * Quota codes are terminal; everything else is safe to retry.
+ */
+function upstreamFailure(upstream: Response, error: unknown): NextResponse {
+  const code =
+    error && typeof error === 'object' && 'code' in error
+      ? String((error as { code?: unknown }).code || '')
+      : '';
+  const message =
+    error && typeof error === 'object' && 'message' in error
+      ? String((error as { message?: unknown }).message || '')
+      : typeof error === 'string'
+        ? error
+        : '';
+  const wait = retryAfterSeconds(upstream);
+
+  // Quota problems have no useful retry timer: the allowance is spent, so stop
+  // the batch instead of hammering the endpoint.
+  if (code === 'image_cap_reached') {
+    return NextResponse.json(
+      {
+        error:
+          'The monthly screenshot allowance for links.et is used up. Verify again from a receipt link, or upgrade the plan.',
+        quotaExceeded: true,
+      },
+      { status: 429 }
+    );
+  }
+  if (code === 'quota_exceeded') {
+    return NextResponse.json(
+      {
+        error:
+          'The links.et verification quota for this period is used up. Cached receipts still verify for free.',
+        quotaExceeded: true,
+      },
+      { status: 429 }
+    );
+  }
+
+  // Anything else (rate_limited, busy bank, transient 502/503) is retryable.
+  const status = upstream.status >= 500 ? 503 : upstream.status;
+  return NextResponse.json(
+    {
+      error: message || 'Verification failed at links.et.',
+      retryAfterSeconds: wait,
+    },
+    {
+      status,
+      headers: wait ? { 'Retry-After': String(wait) } : undefined,
+    }
+  );
+}
+
+/** Verifies a screenshot through links.et's image detector. */
+async function verifyScreenshot(imageBase64: string, apiKey: string): Promise<NextResponse> {
+  const upstream = await fetch(LINKS_ET_IMAGE_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      'x-api-key': apiKey,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ imageBase64 }),
+    // A hung request must not block the cashier's batch forever.
+    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+  }).catch((netErr) => {
+    console.warn('Network failure calling links.et verify-image:', netErr);
+    return null;
+  });
+
+  if (!upstream) {
+    // Transport-level failure: the receipt may still be resolving upstream,
+    // and a retry will hit their cache, so this is worth retrying.
+    return NextResponse.json(
+      {
+        error:
+          'links.et did not respond in time. Retrying usually succeeds because the receipt is cached upstream.',
+      },
+      { status: 503 }
+    );
+  }
+
+  const envelope = (await upstream.json().catch(() => null)) as LinksEtEnvelope | null;
+  if (!upstream.ok || !envelope) {
+    return upstreamFailure(upstream, envelope?.error);
+  }
+
+  return outcomeToResponse(normalizeVerification(envelope));
+}
+
+/** Verifies a full receipt URL — the only path for banks needing a real link. */
+async function verifyReceiptUrl(url: string, apiKey: string): Promise<NextResponse> {
+  const upstream = await fetch(LINKS_ET_VERIFY_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      'x-api-key': apiKey,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ url }),
+    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+  }).catch((netErr) => {
+    console.warn('Network failure calling links.et verify:', netErr);
+    return null;
+  });
+
+  if (!upstream) {
+    return NextResponse.json(
+      {
+        error:
+          'links.et did not respond in time. Retrying usually succeeds because the receipt is cached upstream.',
+      },
+      { status: 503 }
+    );
+  }
+
+  const envelope = (await upstream.json().catch(() => null)) as LinksEtVerifyEnvelope | null;
+
+  if (!upstream.ok) {
+    // 502 "parsed but invalid" carries a partial receipt: not a confirmation,
+    // but not a transport problem either — report it as unverified.
+    if (envelope && envelope.ok === false && envelope.receipt) {
+      return outcomeToResponse(normalizeUrlVerification(envelope));
+    }
+    return upstreamFailure(upstream, envelope?.error);
+  }
+
+  if (!envelope) return upstreamFailure(upstream, null);
+  return outcomeToResponse(normalizeUrlVerification(envelope));
+}
+
 export async function POST(req: NextRequest) {
   try {
     // 0. Rate limit before parsing any body or spending a metered read.
@@ -92,6 +253,35 @@ export async function POST(req: NextRequest) {
     }
 
     const body = await req.json().catch(() => null);
+
+    // The key is a server-side credential and must never reach the browser.
+    const apiKey = process.env.LINKS_ET_API_KEY;
+    if (!apiKey) {
+      return NextResponse.json(
+        {
+          error:
+            'LINKS_ET_API_KEY is not configured. Add your links.et API key to .env.local to verify receipts with the bank.',
+          missingApiKey: true,
+        },
+        { status: 500 }
+      );
+    }
+
+    // Path A: a full receipt URL (from the receipt's QR code or pasted by the
+    // cashier). Works for every provider, including the banks that cannot be
+    // verified from a screenshot.
+    const url = typeof body?.url === 'string' ? body.url.trim() : '';
+    if (url) {
+      if (!/^https?:\/\//i.test(url) || url.length > MAX_URL_LENGTH) {
+        return NextResponse.json(
+          { error: 'A valid http(s) receipt link is required.' },
+          { status: 400 }
+        );
+      }
+      return verifyReceiptUrl(url, apiKey);
+    }
+
+    // Path B: a screenshot.
     const image = body?.image;
     const mimeType = body?.mimeType ?? 'image/jpeg';
 
@@ -120,105 +310,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // The key is a server-side credential and must never reach the browser.
-    const apiKey = process.env.LINKS_ET_API_KEY;
-    if (!apiKey) {
-      return NextResponse.json(
-        {
-          error:
-            'LINKS_ET_API_KEY is not configured. Add your links.et API key to .env.local to verify receipts with the bank.',
-          missingApiKey: true,
-        },
-        { status: 500 }
-      );
-    }
-
-    const upstream = await fetch(LINKS_ET_ENDPOINT, {
-      method: 'POST',
-      headers: {
-        'x-api-key': apiKey,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ imageBase64: cleanBase64 }),
-      // A hung request must not block the cashier's batch forever.
-      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-    }).catch((netErr) => {
-      console.warn('Network failure calling links.et verify-image:', netErr);
-      return null;
-    });
-
-    if (!upstream) {
-      // Transport-level failure: the receipt may still be resolving upstream,
-      // and a retry will hit their cache, so this is worth retrying.
-      return NextResponse.json(
-        {
-          error:
-            'links.et did not respond in time. Retrying usually succeeds because the receipt is cached upstream.',
-        },
-        { status: 503 }
-      );
-    }
-
-    const envelope = (await upstream.json().catch(() => null)) as LinksEtEnvelope | null;
-
-    if (!upstream.ok || !envelope) {
-      const code = envelope?.error?.code || '';
-      const wait = retryAfterSeconds(upstream);
-
-      // Quota problems have no useful retry timer: the monthly screenshot
-      // allowance is spent, so stop the batch instead of hammering the endpoint.
-      if (code === 'image_cap_reached') {
-        return NextResponse.json(
-          {
-            error:
-              'The monthly screenshot allowance for links.et is used up. Verify again from a receipt link, or upgrade the plan.',
-            quotaExceeded: true,
-          },
-          { status: 429 }
-        );
-      }
-      if (code === 'quota_exceeded') {
-        return NextResponse.json(
-          {
-            error:
-              'The links.et verification quota for this period is used up. Cached receipts still verify for free.',
-            quotaExceeded: true,
-          },
-          { status: 429 }
-        );
-      }
-
-      // Anything else (rate_limited, busy bank, transient 502/503) is retryable.
-      const status = upstream.status >= 500 ? 503 : upstream.status;
-      return NextResponse.json(
-        {
-          error: envelope?.error?.message || 'Verification failed at links.et.',
-          retryAfterSeconds: wait,
-        },
-        {
-          status,
-          headers: wait ? { 'Retry-After': String(wait) } : undefined,
-        }
-      );
-    }
-
-    const outcome = normalizeVerification(envelope);
-
-    if (outcome.status === 'verified') {
-      return NextResponse.json({
-        ok: true,
-        status: 'verified',
-        receipt: outcome.receipt,
-      } satisfies VerifyApiResponse);
-    }
-
-    return NextResponse.json({
-      ok: true,
-      status: 'unverified',
-      reason: outcome.reason,
-      provider: outcome.detected?.provider,
-      reference: outcome.detected?.reference ?? undefined,
-    } satisfies VerifyApiResponse);
+    return verifyScreenshot(cleanBase64, apiKey);
   } catch (err: unknown) {
     console.error('Unhandled error in /api/verify:', err);
     return NextResponse.json(

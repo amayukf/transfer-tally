@@ -445,6 +445,24 @@ button, input, select, textarea {
   text-align: left;
 }
 
+/* Receipt-link fallback input */
+.link-verify-row {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  width: 100%;
+}
+
+.link-verify-row .form-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.link-verify-row .btn-secondary {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 .extraction-mode-row {
   display: flex;
   align-items: center;
@@ -844,12 +862,35 @@ button, input, select, textarea {
 .verify-band {
   display: flex;
   align-items: flex-start;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 8px 12px;
   border-radius: var(--radius-sm);
   font-size: 0.8rem;
   font-weight: 600;
   line-height: 1.35;
+}
+
+.verify-band-text {
+  flex: 1 1 60%;
+}
+
+.verify-band-action {
+  margin-left: auto;
+  align-self: center;
+  padding: 4px 10px;
+  border: 1px solid currentColor;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
+  font-size: 0.75rem;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.verify-band-action:hover {
+  background: rgba(0, 0, 0, 0.06);
 }
 
 .verify-band-ok {

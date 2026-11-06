@@ -54,6 +54,30 @@ const DICT: Record<string, Entry> = {
     am: 'እያንዳንዱ ስክሪንሾት ከባንኩ ጋር በlinks.et ይረጋገጣል፤ ስለዚህ መጠኑ ከባንኩ ደረሰኝ ይመጣል \u2014 ከምስሉ አይደለም።',
   },
 
+  /* Receipt link fallback (banks whose URL is not on the screenshot) */
+  'link.title': { en: 'Verify a receipt link', am: 'የደረሰኝ ሊንክ ያረጋግጡ' },
+  'link.placeholder': {
+    en: 'https://\u2026 paste the receipt link',
+    am: 'https://\u2026 የደረሰኝ ሊንክ ይለጥፉ',
+  },
+  'link.verify': { en: 'Verify link', am: 'ሊንኩን ያረጋግጡ' },
+  'link.hint': {
+    en: 'CBE, Awash, Zemen and Dashen cannot be confirmed from a photo alone. Ask the customer to share the receipt link, then paste it here.',
+    am: 'CBE፣ አዋሽ፣ ዘመን እና ዳሽን ከፎቶ ብቻ ሊረጋገጡ አይችሉም። ደንበኛው የደረሰኝ ሊንክ እንዲያጋራ ጠይቀው ከዚህ ይለጥፉ።',
+  },
+  'link.invalid': {
+    en: 'Enter a valid http(s) receipt link.',
+    am: 'ትክክለኛ የhttp(s) ደረሰኝ ሊንክ ያስገቡ።',
+  },
+  'link.verified': {
+    en: 'The bank confirmed the transfer.',
+    am: 'ባንኩ ዝውውሩን አረጋግጧል።',
+  },
+  'link.failed': {
+    en: 'The bank could not confirm this link.',
+    am: 'ባንኩ ይህን ሊንክ ማረጋገጥ አልቻለም።',
+  },
+
   /* Bank verification (links.et) */
   'verify.verifiedBadge': { en: '\u2713 Bank verified', am: '\u2713 በባንክ ተረጋግጧል' },
   'verify.unverifiedBadge': { en: '\u26a0\ufe0f Not verified', am: '\u26a0\ufe0f አልተረጋገጠም' },
@@ -145,6 +169,7 @@ const DICT: Record<string, Entry> = {
     am: 'ደረሰኝ አይደለም (ተገልሏል)',
   },
   'card.emptyRef': { en: '(Empty - Needs Review)', am: '(ባዶ - እይታ ይፈልጋል)' },
+  'card.verifyByLink': { en: 'Verify by link', am: 'በሊንክ ያረጋግጡ' },
   'card.viewReceipt': { en: 'View Receipt', am: 'ደረሰኙን ይመልከቱ' },
   'card.edit': { en: 'Edit', am: 'አርትዕ' },
   'card.delete': { en: 'Delete', am: 'አጥፋ' },
@@ -277,6 +302,10 @@ const DICT: Record<string, Entry> = {
   'status.cachedCheck': {
     en: 'Reusing the earlier bank check for screenshot {i} of {n}\u2026',
     am: 'ለስክሪንሾት {i} ከ{n} ቀደም የተደረገው ማረጋገጫ በመጠቀም ላይ\u2026',
+  },
+  'status.verifyingLink': {
+    en: 'Checking the receipt link with the bank\u2026',
+    am: 'የደረሰኝ ሊንኩን ከባንኩ ጋር በማረጋገጥ ላይ\u2026',
   },
   'status.retrying': {
     en: 'Verification service busy. Retrying in {s}s (attempt {a} of {b})\u2026',

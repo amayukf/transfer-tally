@@ -265,3 +265,50 @@ export function normalizeVerification(envelope: LinksEtEnvelope): VerificationOu
 
   return { status: 'verified', receipt };
 }
+
+/* ------------------------------------------------------------------ */
+/* Response shape (links.et /api/verify — a full receipt URL)          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The flat envelope returned by `POST /api/verify`, which takes a full receipt
+ * URL. It is the only path that works for banks whose lookup URL cannot be
+ * rebuilt from a screenshot (CBE, Awash, Zemen, Dashen…), so the client uses
+ * it with a URL read from the receipt's QR code or pasted by the cashier.
+ */
+export interface LinksEtVerifyEnvelope {
+  ok: boolean;
+  providerKey?: string;
+  resolvedUrl?: string;
+  httpStatus?: number;
+  fetchedAt?: string;
+  receipt?: Record<string, unknown> | null;
+  error?: string | { code?: string; message?: string } | null;
+}
+
+/**
+ * Reduces a links.et `/api/verify` envelope to a bank-confirmed receipt or a
+ * reason it could not be confirmed. A 502 "parsed but invalid" response also
+ * lands here as `upstream_failed`, since the cashier only cares whether the
+ * bank confirmed the money.
+ */
+export function normalizeUrlVerification(envelope: LinksEtVerifyEnvelope | null): VerificationOutcome {
+  if (!envelope?.ok || !envelope.receipt) {
+    return { status: 'unverified', reason: 'upstream_failed' };
+  }
+
+  const receipt = buildReceipt(
+    envelope.receipt,
+    asString(envelope.providerKey),
+    asString(envelope.resolvedUrl),
+    asString(envelope.fetchedAt),
+    false
+  );
+
+  if (!receipt) return { status: 'unverified', reason: 'amount_not_found' };
+  if (receipt.status && REJECTED_STATUS.test(receipt.status)) {
+    return { status: 'unverified', reason: 'not_completed' };
+  }
+
+  return { status: 'verified', receipt };
+}

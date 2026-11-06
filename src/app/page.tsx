@@ -131,10 +131,58 @@ async function fingerprintFile(file: File): Promise<string> {
   }
 }
 
+/**
+ * Reads the receipt URL out of the QR code printed on a screenshot, using the
+ * phone's own barcode reader. Decoding happens on-device and costs nothing.
+ *
+ * This is what makes the banks whose lookup URL cannot be rebuilt from a photo
+ * (CBE, Awash, Zemen, Dashen…) verifiable: their QR carries the full receipt
+ * link, and links.et /api/verify fetches that for all 17 providers.
+ * Returns null when the browser has no reader, or the image has no QR/link.
+ */
+type BarcodeDetectorResult = { rawValue: string };
+type BarcodeDetectorLike = {
+  detect: (source: ImageBitmap) => Promise<BarcodeDetectorResult[]>;
+};
+
+async function decodeQrUrl(file: File): Promise<string | null> {
+  if (typeof window === 'undefined') return null;
+  const Detector = (
+    window as unknown as {
+      BarcodeDetector?: new (options?: { formats?: string[] }) => BarcodeDetectorLike;
+    }
+  ).BarcodeDetector;
+  if (!Detector) return null;
+
+  let bitmap: ImageBitmap;
+  try {
+    bitmap = await createImageBitmap(file);
+  } catch {
+    return null;
+  }
+
+  try {
+    const codes = await new Detector({ formats: ['qr_code'] }).detect(bitmap);
+    for (const code of codes) {
+      // The QR usually holds just the URL, but some wrap it in SMS text.
+      const match = String(code.rawValue || '').match(/https?:\/\/[^\s"'<>]+/i);
+      if (match) return match[0];
+    }
+    return null;
+  } catch {
+    return null; // No QR, unsupported format, or a decoder that threw.
+  } finally {
+    bitmap.close();
+  }
+}
+
 type VerifyAttempt =
   | { kind: 'outcome'; value: VerifyApiResponse }
   | { kind: 'retry'; message: string; retryAfterSeconds?: number }
   | { kind: 'fatal'; message: string; variant?: 'quota' | 'key' };
+
+/** A screenshot to verify, or the receipt URL read from its QR / pasted. */
+type VerifyPayload = { image: string; mimeType: string } | { url: string };
 
 /**
  * Performs a single bank verification through our own /api/verify proxy (the
@@ -142,15 +190,14 @@ type VerifyAttempt =
  * caller can decide whether a retry is worthwhile.
  */
 async function requestVerification(
-  image: string,
-  mimeType: string,
+  payload: VerifyPayload,
   translateMessage: (key: string) => string
 ): Promise<VerifyAttempt> {
   try {
     const res = await fetch('/api/verify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image, mimeType }),
+      body: JSON.stringify(payload),
     });
 
     if (res.ok) {
@@ -227,6 +274,10 @@ export default function TransferTallyPage() {
   // File Input Refs
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
+
+  // Receipt link the cashier pastes for banks whose QR is missing/cropped.
+  const [linkUrl, setLinkUrl] = useState('');
+  const linkInputRef = useRef<HTMLInputElement>(null);
 
   // Image-fingerprint → bank result, held in memory for this session and
   // mirrored to localStorage so the same screenshot never bills twice.
@@ -333,6 +384,136 @@ export default function TransferTallyPage() {
   }, [transfers, historicalRefs]);
 
   /**
+   * A row built from a bank verification result. Verified rows carry the bank's
+   * own fields; unverified rows stay on screen so the cashier can enter the
+   * transfer by hand.
+   */
+  const rowFromOutcome = (
+    outcome: VerifyApiResponse,
+    extras: { preview?: string; fileName?: string }
+  ): TransferRecord => {
+    if (outcome.status === 'verified') {
+      const r = outcome.receipt;
+      return {
+        id: generateTransferId(),
+        bank: providerLabel(r.provider) || r.provider || t('card.unknownBank'),
+        amount: r.amount,
+        sender_name: r.payer_name,
+        receiver_name: r.receiver_name,
+        date_time: r.paid_at || new Date().toLocaleString(),
+        reference_no: r.reference,
+        confidence: 'high',
+        is_receipt: true,
+        verification: 'verified',
+        verified_receipt: r,
+        image_preview: extras.preview,
+        file_name: extras.fileName,
+        created_at: new Date().toISOString(),
+      };
+    }
+
+    return {
+      id: generateTransferId(),
+      bank: providerLabel(outcome.provider) || '',
+      amount: 0,
+      sender_name: '',
+      receiver_name: '',
+      date_time: new Date().toLocaleString(),
+      reference_no: outcome.reference || '',
+      confidence: 'low',
+      is_receipt: true,
+      verification: 'unverified',
+      verification_note: outcome.reason,
+      image_preview: extras.preview,
+      file_name: extras.fileName,
+      created_at: new Date().toISOString(),
+    };
+  };
+
+  /**
+   * Runs one verification with a single bounded retry. The retry leans on
+   * links.et's cache: the first call already made the bank fetch the receipt,
+   * so the second returns instantly.
+   */
+  const runVerification = async (
+    payload: VerifyPayload,
+    describe: (attempt: number) => string
+  ): Promise<{
+    outcome?: VerifyApiResponse;
+    failureMessage?: string;
+    failureVariant?: 'quota' | 'key';
+  }> => {
+    for (let attempt = 1; attempt <= VERIFY_MAX_ATTEMPTS; attempt++) {
+      setProcessingStatus(describe(attempt));
+
+      const result = await requestVerification(payload, t);
+
+      if (result.kind === 'outcome') return { outcome: result.value };
+      if (result.kind === 'fatal') {
+        return { failureMessage: result.message, failureVariant: result.variant };
+      }
+      if (attempt >= VERIFY_MAX_ATTEMPTS) return { failureMessage: result.message };
+
+      // Wait as long as the server asked, bounded so a large batch never stalls
+      // on a single screenshot.
+      const waitSeconds = Math.min(
+        Math.max(result.retryAfterSeconds ?? RETRY_BACKOFF_SECONDS, 2),
+        20
+      );
+      setRetryAttempt(attempt);
+      for (let sec = waitSeconds; sec > 0; sec--) {
+        setProcessingStatus(
+          t('status.retrying', { s: sec, a: attempt + 1, b: VERIFY_MAX_ATTEMPTS })
+        );
+        await sleep(1000);
+      }
+      setRetryAttempt(null);
+    }
+    return { failureMessage: t('err.network') };
+  };
+
+  /**
+   * Verifies a receipt link the cashier pasted. This is the manual fallback for
+   * CBE, Awash, Zemen and Dashen, whose receipt URL cannot be rebuilt from a
+   * screenshot — and the only way in when the QR is cropped or unreadable.
+   */
+  const handleVerifyLink = async () => {
+    const url = linkUrl.trim();
+    if (!/^https?:\/\//i.test(url)) {
+      showToast(t('link.invalid'));
+      return;
+    }
+
+    setIsProcessing(true);
+    setProgressTotal(1);
+    setProgressCurrent(0);
+
+    try {
+      const run = await runVerification({ url }, () => t('status.verifyingLink'));
+      setRetryAttempt(null);
+
+      if (run.outcome) {
+        const outcome = run.outcome;
+        setTransfers((prev) => [...prev, rowFromOutcome(outcome, {})]);
+        showToast(outcome.status === 'verified' ? t('link.verified') : t('link.failed'));
+        if (outcome.status === 'verified') setLinkUrl('');
+      } else if (run.failureVariant === 'quota') {
+        showToast(t('toast.quotaExceeded'));
+      } else if (run.failureVariant === 'key') {
+        showToast(t('toast.keyMissing'));
+      } else {
+        showToast(t('toast.verifyFailed', { name: url, reason: run.failureMessage || '' }));
+      }
+    } finally {
+      setIsProcessing(false);
+      setProgressCurrent(0);
+      setProgressTotal(0);
+      setProcessingStatus('');
+      setRetryAttempt(null);
+    }
+  };
+
+  /**
    * Batch upload: every screenshot is checked with the bank through links.et
    * (proxied by /api/verify) and the row is built from the bank's own receipt,
    * never from the pixels of the image.
@@ -402,45 +583,36 @@ export default function TransferTallyPage() {
                   reference: cached.reference,
                 };
         } else {
-          const payload = await buildVerifyPayload(file);
-
-          for (let attempt = 1; attempt <= VERIFY_MAX_ATTEMPTS; attempt++) {
-            setProcessingStatus(t('status.verifying', { i: i + 1, n: validFiles.length }));
-
-            const result = await requestVerification(payload.image, payload.mimeType, t);
-            if (result.kind === 'outcome') {
-              outcome = result.value;
-              break;
-            }
-            if (result.kind === 'fatal') {
-              failureMessage = result.message;
-              failureVariant = result.variant;
-              break;
-            }
-            if (attempt >= VERIFY_MAX_ATTEMPTS) {
-              failureMessage = result.message;
-              break;
-            }
-
-            // Wait as long as the server asked, bounded so a large batch never
-            // stalls on a single screenshot. A retry usually hits links.et's
-            // cache, because the first call already made the bank fetch it.
-            const waitSeconds = Math.min(
-              Math.max(result.retryAfterSeconds ?? RETRY_BACKOFF_SECONDS, 2),
-              20
+          // 3. The QR on the receipt carries the bank's own lookup URL. Reading
+          //    it on-device makes the banks that cannot be rebuilt from a
+          //    screenshot (CBE, Awash, Zemen, Dashen…) verifiable, and it costs
+          //    nothing extra.
+          const qrUrl = await decodeQrUrl(file);
+          if (qrUrl) {
+            const urlRun = await runVerification({ url: qrUrl }, () =>
+              t('status.verifying', { i: i + 1, n: validFiles.length })
             );
-            setRetryAttempt(attempt);
-            for (let sec = waitSeconds; sec > 0; sec--) {
-              setProcessingStatus(
-                t('status.retrying', {
-                  s: sec,
-                  a: attempt + 1,
-                  b: VERIFY_MAX_ATTEMPTS,
-                })
-              );
-              await sleep(1000);
+            if (urlRun.outcome?.status === 'verified') {
+              outcome = urlRun.outcome;
+            } else if (urlRun.failureVariant) {
+              failureMessage = urlRun.failureMessage || '';
+              failureVariant = urlRun.failureVariant;
             }
-            setRetryAttempt(null);
+          }
+
+          // 4. Fall back to the screenshot endpoint, where Telebirr auto-verifies
+          //    because its URL can be rebuilt from the reference alone.
+          if (!outcome && !failureVariant) {
+            const payload = await buildVerifyPayload(file);
+            const imageRun = await runVerification(payload, () =>
+              t('status.verifying', { i: i + 1, n: validFiles.length })
+            );
+            if (imageRun.outcome) {
+              outcome = imageRun.outcome;
+            } else {
+              failureMessage = imageRun.failureMessage || failureMessage;
+              failureVariant = imageRun.failureVariant || failureVariant;
+            }
           }
         }
         setRetryAttempt(null);
@@ -451,7 +623,7 @@ export default function TransferTallyPage() {
           });
         }
 
-        // 3. Park the bank's answer against the image fingerprint.
+        // 5. Park the bank's answer against the image fingerprint.
         if (fingerprint) {
           const entry: CachedVerification =
             outcome.status === 'verified'
@@ -471,46 +643,12 @@ export default function TransferTallyPage() {
           setVerifyCacheEntry(fingerprint, entry);
         }
 
-        if (outcome.status === 'verified') {
-          // 4a. The row IS the bank's receipt — amount, payer and time all come
-          //     from the bank, so a doctored screenshot cannot get through.
-          const r = outcome.receipt;
-          newExtractedTransfers[i] = {
-            id: generateTransferId(),
-            bank: providerLabel(r.provider) || r.provider || t('card.unknownBank'),
-            amount: r.amount,
-            sender_name: r.payer_name,
-            receiver_name: r.receiver_name,
-            date_time: r.paid_at || new Date().toLocaleString(),
-            reference_no: r.reference,
-            confidence: 'high',
-            is_receipt: true,
-            verification: 'verified',
-            verified_receipt: r,
-            image_preview: preview.dataUrl,
-            file_name: file.name,
-            created_at: new Date().toISOString(),
-          };
-        } else {
-          // 4b. Not confirmed. The cashier types the amount and reference by
-          //     hand; the row stays flagged as unverified.
-          newExtractedTransfers[i] = {
-            id: generateTransferId(),
-            bank: providerLabel(outcome.provider) || '',
-            amount: 0,
-            sender_name: '',
-            receiver_name: '',
-            date_time: new Date().toLocaleString(),
-            reference_no: outcome.reference || '',
-            confidence: 'low',
-            is_receipt: true,
-            verification: 'unverified',
-            verification_note: outcome.reason,
-            image_preview: preview.dataUrl,
-            file_name: file.name,
-            created_at: new Date().toISOString(),
-          };
-        }
+        // 6. The row is built from the bank's answer — amount, payer and time all
+        //    come from the bank, so a doctored screenshot cannot get through.
+        newExtractedTransfers[i] = rowFromOutcome(outcome, {
+          preview: preview.dataUrl,
+          fileName: file.name,
+        });
       } catch (err: unknown) {
         console.error(`Error verifying ${file.name}:`, err);
         const reason = err instanceof Error ? err.message : 'unknown error';
@@ -528,21 +666,10 @@ export default function TransferTallyPage() {
         }
 
         // Keep the card so the cashier can still enter the transfer by hand.
-        newExtractedTransfers[i] = {
-          id: generateTransferId(),
-          bank: '',
-          amount: 0,
-          sender_name: '',
-          receiver_name: '',
-          date_time: new Date().toLocaleString(),
-          reference_no: '',
-          confidence: 'low',
-          is_receipt: true,
-          verification: 'unverified',
-          verification_note: 'upstream_failed',
-          file_name: file.name,
-          created_at: new Date().toISOString(),
-        };
+        newExtractedTransfers[i] = rowFromOutcome(
+          { ok: true, status: 'unverified', reason: 'upstream_failed' },
+          { fileName: file.name }
+        );
       } finally {
         completed++;
         setProgressCurrent(completed);
@@ -936,6 +1063,33 @@ export default function TransferTallyPage() {
                 <span aria-hidden="true">🛡️</span>
                 <span>{t('upload.verifyHint')}</span>
               </div>
+
+              {/* Manual fallback: banks whose receipt URL is not on the photo. */}
+              <div className="link-verify-row">
+                <input
+                  ref={linkInputRef}
+                  type="url"
+                  className="form-input"
+                  placeholder={t('link.placeholder')}
+                  value={linkUrl}
+                  onChange={(e) => setLinkUrl(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') handleVerifyLink();
+                  }}
+                  disabled={isProcessing}
+                  inputMode="url"
+                  autoComplete="off"
+                  aria-label={t('link.title')}
+                />
+                <button
+                  className="btn-secondary"
+                  onClick={handleVerifyLink}
+                  disabled={isProcessing || !linkUrl.trim()}
+                >
+                  🔗 {t('link.verify')}
+                </button>
+              </div>
+              <p className="upload-hint">{t('link.hint')}</p>
             </section>
 
             {/* Processing Progress Bar & Status */}
@@ -1094,7 +1248,22 @@ export default function TransferTallyPage() {
                       {isUnverified && (
                         <div className="verify-band verify-band-warn">
                           <span aria-hidden="true">⚠️</span>
-                          <span>{verifyReasonText(item.verification_note)}</span>
+                          <span className="verify-band-text">
+                            {verifyReasonText(item.verification_note)}
+                          </span>
+                          <button
+                            type="button"
+                            className="verify-band-action"
+                            onClick={() => {
+                              linkInputRef.current?.focus();
+                              linkInputRef.current?.scrollIntoView({
+                                behavior: 'smooth',
+                                block: 'center',
+                              });
+                            }}
+                          >
+                            🔗 {t('card.verifyByLink')}
+                          </button>
                         </div>
                       )}
 
