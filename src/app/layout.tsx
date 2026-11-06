@@ -33,6 +33,21 @@ export default function RootLayout({
     <html lang="en" suppressHydrationWarning>
       <head>
         <link rel="apple-touch-icon" href="/icon.svg" />
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `
+              (function () {
+                try {
+                  var lang = localStorage.getItem('tt_language');
+                  if (lang !== 'en' && lang !== 'am') {
+                    lang = (navigator.language || '').toLowerCase().indexOf('am') === 0 ? 'am' : 'en';
+                  }
+                  document.documentElement.setAttribute('lang', lang);
+                } catch (e) {}
+              })();
+            `,
+          }}
+        />
       </head>
       <body>
         {children}

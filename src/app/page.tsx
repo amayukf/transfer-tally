@@ -20,6 +20,12 @@ import {
   exportTransfersToCsv,
 } from '@/utils/storage';
 import { extractWithOcr, getOcrConcurrency, prewarmOcr, terminateOcrWorker } from '@/utils/ocr';
+import {
+  translate,
+  readStoredLanguage,
+  LANGUAGE_STORAGE_KEY,
+  type Language,
+} from '@/utils/i18n';
 
 const MAX_UPLOAD_FILE_SIZE = 15 * 1024 * 1024; // 15MB file cap
 const MAX_EXTRACTION_ATTEMPTS = 3; // 1 initial request + up to 2 retries
@@ -79,9 +85,9 @@ type ExtractionMode = 'on-device' | 'hybrid' | 'ai';
 const EXTRACTION_MODE_STORAGE_KEY = 'tt_extraction_mode';
 
 function readStoredExtractionMode(): ExtractionMode {
-  if (typeof window === 'undefined') return 'hybrid';
+  if (typeof window === 'undefined') return 'on-device';
   const raw = localStorage.getItem(EXTRACTION_MODE_STORAGE_KEY);
-  return raw === 'on-device' || raw === 'hybrid' || raw === 'ai' ? raw : 'hybrid';
+  return raw === 'on-device' || raw === 'hybrid' || raw === 'ai' ? raw : 'on-device';
 }
 
 /**
@@ -92,7 +98,8 @@ function readStoredExtractionMode(): ExtractionMode {
 async function requestExtraction(
   image: string,
   mimeType: string,
-  fileName: string
+  fileName: string,
+  translateMessage: (key: string) => string
 ): Promise<ExtractionAttempt> {
   try {
     const res = await fetch('/api/extract', {
@@ -137,7 +144,7 @@ async function requestExtraction(
   } catch {
     return {
       kind: 'retry',
-      message: 'Network error while contacting the extraction service.',
+      message: translateMessage('err.network'),
     };
   }
 }
@@ -149,8 +156,11 @@ export default function TransferTallyPage() {
   // Theme: 'light' | 'dark'
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
 
+  // UI language: 'en' | 'am'
+  const [language, setLanguage] = useState<Language>('en');
+
   // Extraction mode: on-device OCR only, OCR + AI fallback, or AI only.
-  const [extractionMode, setExtractionMode] = useState<ExtractionMode>('hybrid');
+  const [extractionMode, setExtractionMode] = useState<ExtractionMode>('on-device');
 
   // Day context (defaults to local YYYY-MM-DD)
   const [selectedDate, setSelectedDate] = useState<string>('');
@@ -187,6 +197,10 @@ export default function TransferTallyPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
 
+  // Translation helper bound to the active language.
+  const t = (key: string, vars?: Record<string, string | number>): string =>
+    translate(language, key, vars);
+
   const refreshHistoricalData = React.useCallback(() => {
     setSavedDays(getSavedDays());
   }, []);
@@ -197,9 +211,9 @@ export default function TransferTallyPage() {
     const refs = new Set<string>();
     for (const day of savedDays) {
       if (loadedDayId && day.id === loadedDayId) continue;
-      for (const t of day.transfers) {
-        const ref = normalizeReference(t.reference_no);
-        if (ref && !t.is_duplicate && !t.missing_reference) {
+      for (const transfer of day.transfers) {
+        const ref = normalizeReference(transfer.reference_no);
+        if (ref && !transfer.is_duplicate && !transfer.missing_reference) {
           refs.add(ref);
         }
       }
@@ -218,7 +232,7 @@ export default function TransferTallyPage() {
     }, 3500);
   }, []);
 
-  // Initialize theme, today's local date, and load historical data on mount
+  // Initialize theme, language, today's local date, and load historical data on mount
   useEffect(() => {
     // Start downloading the OCR engine right away: the first scan should not
     // stall on a ~15MB download while the cashier waits.
@@ -228,6 +242,10 @@ export default function TransferTallyPage() {
       setSelectedDate(getLocalTodayDateString());
       refreshHistoricalData();
       setExtractionMode(readStoredExtractionMode());
+
+      const savedLanguage = readStoredLanguage();
+      setLanguage(savedLanguage);
+      document.documentElement.setAttribute('lang', savedLanguage);
 
       const savedTheme = localStorage.getItem('tt_theme') as 'light' | 'dark' | null;
       if (savedTheme) {
@@ -258,6 +276,17 @@ export default function TransferTallyPage() {
     document.documentElement.setAttribute('data-theme', next);
   };
 
+  const toggleLanguage = () => {
+    const next: Language = language === 'en' ? 'am' : 'en';
+    setLanguage(next);
+    try {
+      localStorage.setItem(LANGUAGE_STORAGE_KEY, next);
+    } catch {
+      // Ignore storage failures (private mode / quota) — language still applies.
+    }
+    document.documentElement.setAttribute('lang', next);
+  };
+
   const changeExtractionMode = (mode: ExtractionMode) => {
     setExtractionMode(mode);
     try {
@@ -283,11 +312,11 @@ export default function TransferTallyPage() {
     const validFiles: File[] = [];
     for (const file of files) {
       if (!file || !file.type.startsWith('image/') || file.size <= 0) {
-        showToast(`Skipped ${file?.name || 'file'}: not a valid image.`);
+        showToast(t('toast.invalidImage', { name: file?.name || 'file' }));
         continue;
       }
       if (file.size > MAX_UPLOAD_FILE_SIZE) {
-        showToast(`Skipped ${file.name}: over 15MB`);
+        showToast(t('toast.tooLarge', { name: file.name }));
         continue;
       }
       validFiles.push(file);
@@ -313,7 +342,7 @@ export default function TransferTallyPage() {
 
     const processOne = async (i: number): Promise<void> => {
       const file = validFiles[i];
-      setProcessingStatus(`Resizing & preparing receipt ${i + 1} of ${validFiles.length}...`);
+      setProcessingStatus(t('status.resizing', { i: i + 1, n: validFiles.length }));
 
       try {
         // 1. Client-side canvas resize (max 1400px, JPEG 0.85)
@@ -325,14 +354,14 @@ export default function TransferTallyPage() {
         //    AI-only mode. The image is read locally and never uploaded here.
         if (extractionMode !== 'ai') {
           try {
-            setProcessingStatus(
-              `Reading receipt ${i + 1} of ${validFiles.length} on-device...`
-            );
+            setProcessingStatus(t('status.reading', { i: i + 1, n: validFiles.length }));
             const ocr = await extractWithOcr(resized.dataUrl, (p) => {
               setProcessingStatus(
-                `Reading receipt ${i + 1} of ${validFiles.length} on-device... ${Math.round(
-                  p * 100
-                )}%`
+                t('status.readingPct', {
+                  i: i + 1,
+                  n: validFiles.length,
+                  p: Math.round(p * 100),
+                })
               );
             });
             // Keep the on-device read when it clearly found amount + reference,
@@ -343,9 +372,7 @@ export default function TransferTallyPage() {
           } catch (ocrErr) {
             console.warn(`On-device OCR failed for ${file.name}:`, ocrErr);
             if (extractionMode === 'on-device') {
-              throw new Error(
-                'On-device reading is unavailable (it needs internet the first time).'
-              );
+              throw new Error(t('status.ocrUnavailable'));
             }
             // hybrid mode: fall through to the AI extractor below.
           }
@@ -356,13 +383,14 @@ export default function TransferTallyPage() {
         if (!result) {
           for (let attempt = 1; attempt <= MAX_EXTRACTION_ATTEMPTS; attempt++) {
             setProcessingStatus(
-              `Scanning receipt ${i + 1} of ${validFiles.length} with AI...`
+              t('status.scanningAi', { i: i + 1, n: validFiles.length })
             );
 
             const outcome = await requestExtraction(
               resized.base64,
               resized.mimeType,
-              file.name
+              file.name,
+              t
             );
 
             if (outcome.kind === 'success') {
@@ -384,9 +412,11 @@ export default function TransferTallyPage() {
             setRetryAttempt(attempt);
             for (let sec = waitSeconds; sec > 0; sec--) {
               setProcessingStatus(
-                `Extraction service busy. Retrying in ${sec}s (attempt ${
-                  attempt + 1
-                } of ${MAX_EXTRACTION_ATTEMPTS})...`
+                t('status.retrying', {
+                  s: sec,
+                  a: attempt + 1,
+                  b: MAX_EXTRACTION_ATTEMPTS,
+                })
               );
               await sleep(1000);
             }
@@ -397,7 +427,7 @@ export default function TransferTallyPage() {
         // 4. Create transfer record with crypto ID
         const record: TransferRecord = {
           id: generateTransferId(),
-          bank: result?.bank || 'Unknown Bank',
+          bank: result?.bank || '',
           amount: typeof result?.amount === 'number' ? result.amount : 0,
           sender_name: result?.sender_name || '',
           receiver_name: result?.receiver_name || '',
@@ -417,7 +447,7 @@ export default function TransferTallyPage() {
         // Add card with low confidence so cashier can enter data manually
         newExtractedTransfers[i] = {
           id: generateTransferId(),
-          bank: 'Unknown / Review Required',
+          bank: t('card.unknownBank'),
           amount: 0,
           sender_name: '',
           receiver_name: '',
@@ -428,7 +458,7 @@ export default function TransferTallyPage() {
           file_name: file.name,
           created_at: new Date().toISOString(),
         };
-        showToast(`Could not read ${file.name}: ${reason} Added it for manual entry.`);
+        showToast(t('toast.readFailed', { name: file.name, reason }));
       } finally {
         completed++;
         setProgressCurrent(completed);
@@ -461,15 +491,19 @@ export default function TransferTallyPage() {
 
     // Summarize the batch result in one toast
     const nonReceiptInBatch = newExtractedTransfers.filter(
-      (t) => t.is_receipt === false
+      (transfer) => transfer.is_receipt === false
     ).length;
     const counted = newExtractedTransfers.length - nonReceiptInBatch;
     if (nonReceiptInBatch > 0) {
       showToast(
-        `Added ${newExtractedTransfers.length} images: ${counted} transfer(s) + ${nonReceiptInBatch} non-receipt(s) excluded.`
+        t('toast.batchSummary', {
+          n: newExtractedTransfers.length,
+          counted,
+          nonReceipt: nonReceiptInBatch,
+        })
       );
     } else {
-      showToast(`Added ${counted} transfer(s) to the batch.`);
+      showToast(t('toast.batchAdded', { n: counted }));
     }
   };
 
@@ -510,14 +544,14 @@ export default function TransferTallyPage() {
 
         if (files.length > 0) {
           setActiveTab('batch');
-          showToast(`Received ${files.length} shared image(s). Scanning...`);
+          showToast(t('toast.sharedReceived', { n: files.length }));
           await processFilesSequentially(files);
         } else if (sharedState === 'error') {
-          showToast('Could not receive the shared images — use Pick Screenshots instead.');
+          showToast(t('toast.sharedError'));
         }
       } catch (err) {
         console.error('Failed to import shared images:', err);
-        if (!cancelled) showToast('Could not import the shared images.');
+        if (!cancelled) showToast(t('toast.sharedImportFailed'));
       }
     })();
 
@@ -539,7 +573,7 @@ export default function TransferTallyPage() {
    */
   const handleSaveDay = () => {
     if (transfers.length === 0) {
-      showToast('No transfers to save.');
+      showToast(t('toast.nothingToSave'));
       return;
     }
 
@@ -547,27 +581,30 @@ export default function TransferTallyPage() {
     // so the cashier confirms the day's file is intentionally correct.
     const warnings: string[] = [];
     if (tally.duplicateCount > 0) {
-      warnings.push(`${tally.duplicateCount} duplicate(s) excluded`);
+      warnings.push(t('review.duplicates', { n: tally.duplicateCount }));
     }
     if (tally.nonReceiptCount > 0) {
-      warnings.push(`${tally.nonReceiptCount} non-receipt(s) excluded`);
+      warnings.push(t('review.nonReceipt', { n: tally.nonReceiptCount }));
     }
     if (tally.missingRefCount > 0) {
-      warnings.push(`${tally.missingRefCount} missing-reference row(s) excluded`);
+      warnings.push(t('review.missingRef', { n: tally.missingRefCount }));
     }
     if (tally.lowConfidenceCount > 0) {
-      warnings.push(`${tally.lowConfidenceCount} low-confidence row(s) counted`);
+      warnings.push(t('review.lowConfidence', { n: tally.lowConfidenceCount }));
     }
 
     if (warnings.length > 0) {
       const proceed = window.confirm(
-        `Day review for ${selectedDate}:\n` +
-          `- ${tally.validCount} transfers will count (ETB ${formatETB(tally.totalAmount)})\n` +
+        `${t('review.header', { date: selectedDate })}\n` +
+          `${t('review.counts', {
+            n: tally.validCount,
+            total: formatETB(tally.totalAmount),
+          })}\n` +
           `- ${warnings.join('\n- ')}\n\n` +
-          'Save the day with these rows?'
+          t('review.ask')
       );
       if (!proceed) {
-        showToast('Save cancelled — review the flagged rows first.');
+        showToast(t('toast.saveCancelled'));
         return;
       }
     }
@@ -586,12 +623,12 @@ export default function TransferTallyPage() {
     if (res.success) {
       refreshHistoricalData();
       if (res.previewsStripped) {
-        showToast('Saved without receipt images (storage limit)');
+        showToast(t('toast.savedNoImages'));
       } else {
-        showToast(`Saved ${tally.validCount} transfers for ${selectedDate}!`);
+        showToast(t('toast.saved', { n: tally.validCount, date: selectedDate }));
       }
     } else {
-      showToast('Failed to save day to localStorage.');
+      showToast(t('toast.saveFailed'));
     }
   };
 
@@ -600,28 +637,28 @@ export default function TransferTallyPage() {
    */
   const handleExportCsv = () => {
     if (transfers.length === 0) {
-      showToast('No transfers to export.');
+      showToast(t('toast.nothingToExport'));
       return;
     }
     exportTransfersToCsv(selectedDate, tally.processedTransfers, tally.totalAmount);
-    showToast(`Exported CSV for ${selectedDate}`);
+    showToast(t('toast.exported', { date: selectedDate }));
   };
 
   /**
    * Delete a transfer row
    */
   const handleDeleteTransfer = (id: string) => {
-    setTransfers((prev) => prev.filter((t) => t.id !== id));
-    showToast('Transfer deleted.');
+    setTransfers((prev) => prev.filter((transfer) => transfer.id !== id));
+    showToast(t('toast.deleted'));
   };
 
   /**
    * Save edited transfer from modal
    */
   const handleSaveEdit = (updated: TransferRecord) => {
-    setTransfers((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+    setTransfers((prev) => prev.map((item) => (item.id === updated.id ? updated : item)));
     setEditingTransfer(null);
-    showToast('Transfer details updated.');
+    showToast(t('toast.updated'));
   };
 
   /**
@@ -629,10 +666,10 @@ export default function TransferTallyPage() {
    */
   const handleClearBatch = () => {
     if (transfers.length === 0) return;
-    if (window.confirm('Clear all transfers from the current screen?')) {
+    if (window.confirm(t('toast.clearConfirm'))) {
       setTransfers([]);
       setLoadedDayId(null);
-      showToast('Cleared current batch.');
+      showToast(t('toast.cleared'));
     }
   };
 
@@ -641,20 +678,20 @@ export default function TransferTallyPage() {
    */
   const handleLoadDayIntoEditor = (day: DayRecord) => {
     setSelectedDate(day.date);
-    setTransfers(day.transfers.map((t) => ({ ...t })));
+    setTransfers(day.transfers.map((transfer) => ({ ...transfer })));
     setLoadedDayId(day.id);
     setActiveTab('batch');
-    showToast(`Loaded ${day.date} with ${day.transfers.length} transfers.`);
+    showToast(t('toast.loaded', { date: day.date, n: day.transfers.length }));
   };
 
   /**
    * Delete a saved day
    */
   const handleDeleteDay = (dayId: string) => {
-    if (window.confirm(`Delete saved record for ${dayId}?`)) {
+    if (window.confirm(t('toast.deleteDayConfirm', { id: dayId }))) {
       deleteDayRecord(dayId);
       refreshHistoricalData();
-      showToast(`Deleted ${dayId}`);
+      showToast(t('toast.dayDeleted', { id: dayId }));
     }
   };
 
@@ -682,78 +719,62 @@ export default function TransferTallyPage() {
       <header className="header-actions">
         <div className="brand-row">
           {/* eslint-disable-next-line @next/next/no-img-element -- fixed-size static brand SVG; next/image adds an optimizer round-trip and no benefit for local SVG */}
-          <img src="/icon.svg" alt="Transfer Tally Logo" className="brand-logo" />
+          <img src="/icon.svg" alt="Transfer Tally" className="brand-logo" />
           <h1 className="brand-title">Transfer Tally</h1>
         </div>
-        <button
-          className="theme-toggle-btn"
-          onClick={toggleTheme}
-          aria-label="Toggle light or dark mode"
-          title="Toggle light / dark mode"
-        >
-          {theme === 'light' ? '🌙' : '☀️'}
-        </button>
+        <div className="header-actions-right">
+          <button
+            className="lang-toggle-btn"
+            onClick={toggleLanguage}
+            aria-label={t('header.toggleLanguageTitle')}
+            title={t('header.toggleLanguageTitle')}
+          >
+            {language === 'en' ? 'አማ' : 'EN'}
+          </button>
+          <button
+            className="theme-toggle-btn"
+            onClick={toggleTheme}
+            aria-label={t('header.toggleThemeTitle')}
+            title={t('header.toggleThemeTitle')}
+          >
+            {theme === 'light' ? '🌙' : '☀️'}
+          </button>
+        </div>
       </header>
 
       {/* Sticky Top Bar with Daylight-Readable Total */}
       <section className="sticky-bar">
         <div className="total-hero">
           <div className="total-main">
-            <span className="total-label">Day Total (Excluding Duplicates)</span>
+            <span className="total-label">{t('total.label')}</span>
             <div className="total-amount-row">
-              <span className="total-currency">ETB</span>
+              <span className="total-currency">{t('currency')}</span>
               <span className="total-amount">{formatETB(tally.totalAmount)}</span>
             </div>
           </div>
           <div className="total-meta">
             <span className="badge-count">
-              {tally.validCount} {tally.validCount === 1 ? 'transfer' : 'transfers'}
+              {tally.validCount}{' '}
+              {tally.validCount === 1 ? t('total.transfer') : t('total.transfers')}
             </span>
             {tally.duplicateCount > 0 && (
               <span className="badge-dup-excluded">
-                ⚠️ {tally.duplicateCount} dup excluded
+                ⚠️ {t('total.dupExcluded', { n: tally.duplicateCount })}
               </span>
             )}
             {tally.missingRefCount > 0 && (
-              <span
-                style={{
-                  background: '#fef3c7',
-                  color: '#b45309',
-                  fontSize: '0.72rem',
-                  fontWeight: 800,
-                  padding: '2px 8px',
-                  borderRadius: '9999px',
-                }}
-              >
-                ⚠️ {tally.missingRefCount} missing ref
+              <span className="total-pill total-pill-warn">
+                ⚠️ {t('total.missingRef', { n: tally.missingRefCount })}
               </span>
             )}
             {tally.nonReceiptCount > 0 && (
-              <span
-                style={{
-                  background: '#fee2e2',
-                  color: '#b91c1c',
-                  fontSize: '0.72rem',
-                  fontWeight: 800,
-                  padding: '2px 8px',
-                  borderRadius: '9999px',
-                }}
-              >
-                🚫 {tally.nonReceiptCount} not a receipt
+              <span className="total-pill total-pill-danger">
+                🚫 {t('total.nonReceipt', { n: tally.nonReceiptCount })}
               </span>
             )}
             {tally.lowConfidenceCount > 0 && (
-              <span
-                style={{
-                  background: '#fef3c7',
-                  color: '#92400e',
-                  fontSize: '0.72rem',
-                  fontWeight: 800,
-                  padding: '2px 8px',
-                  borderRadius: '9999px',
-                }}
-              >
-                🔍 {tally.lowConfidenceCount} review needed
+              <span className="total-pill total-pill-review">
+                🔍 {t('total.reviewNeeded', { n: tally.lowConfidenceCount })}
               </span>
             )}
           </div>
@@ -765,13 +786,13 @@ export default function TransferTallyPage() {
             className={`tab-btn ${activeTab === 'batch' ? 'active' : ''}`}
             onClick={() => setActiveTab('batch')}
           >
-            📋 Today&apos;s Batch ({transfers.length})
+            📋 {t('nav.batch')} ({transfers.length})
           </button>
           <button
             className={`tab-btn ${activeTab === 'history' ? 'active' : ''}`}
             onClick={() => setActiveTab('history')}
           >
-            🗄️ History ({savedDays.length})
+            🗄️ {t('nav.history')} ({savedDays.length})
           </button>
         </nav>
       </section>
@@ -799,8 +820,8 @@ export default function TransferTallyPage() {
                 </svg>
               </div>
               <div>
-                <h3>Upload Transfer Screenshots</h3>
-                <p>Telebirr, CBE, Awash, or any Ethiopian mobile money receipt</p>
+                <h3>{t('upload.title')}</h3>
+                <p>{t('upload.subtitle')}</p>
               </div>
 
               <div className="upload-buttons-row">
@@ -809,24 +830,21 @@ export default function TransferTallyPage() {
                   onClick={() => fileInputRef.current?.click()}
                   disabled={isProcessing}
                 >
-                  📁 Pick Screenshots
+                  📁 {t('upload.pick')}
                 </button>
                 <button
                   className="btn-secondary"
                   onClick={() => cameraInputRef.current?.click()}
                   disabled={isProcessing}
                 >
-                  📸 Take Photo
+                  📸 {t('upload.camera')}
                 </button>
               </div>
 
-              <p className="upload-hint">
-                Or share straight from your gallery: select the screenshots →
-                Share → Transfer Tally.
-              </p>
+              <p className="upload-hint">{t('upload.shareHint')}</p>
 
               <div className="extraction-mode-row">
-                <label htmlFor="extraction-mode">Scan mode</label>
+                <label htmlFor="extraction-mode">{t('scanMode.label')}</label>
                 <select
                   id="extraction-mode"
                   value={extractionMode}
@@ -835,9 +853,9 @@ export default function TransferTallyPage() {
                   }
                   disabled={isProcessing}
                 >
-                  <option value="hybrid">On-device + AI fallback (best accuracy)</option>
-                  <option value="on-device">On-device only (no AI, private)</option>
-                  <option value="ai">AI only</option>
+                  <option value="on-device">{t('scanMode.onDevice')}</option>
+                  <option value="hybrid">{t('scanMode.hybrid')}</option>
+                  <option value="ai">{t('scanMode.ai')}</option>
                 </select>
               </div>
             </section>
@@ -846,10 +864,8 @@ export default function TransferTallyPage() {
             {isProcessing && (
               <section className="progress-card">
                 <div className="progress-header">
-                  <span>Processing Receipts</span>
-                  <span>
-                    {progressCurrent} of {progressTotal}
-                  </span>
+                  <span>{t('progress.title')}</span>
+                  <span>{t('progress.of', { a: progressCurrent, b: progressTotal })}</span>
                 </div>
                 <div className="progress-bar-bg">
                   <div
@@ -863,9 +879,7 @@ export default function TransferTallyPage() {
                 </div>
                 <div className="progress-subtext">{processingStatus}</div>
                 {retryAttempt !== null && (
-                  <div className="rate-limit-banner">
-                    ⏳ Extraction service is busy. Waiting before retry...
-                  </div>
+                  <div className="rate-limit-banner">{t('progress.rateLimited')}</div>
                 )}
               </section>
             )}
@@ -873,9 +887,9 @@ export default function TransferTallyPage() {
             {/* Batch Controls & Date Selector */}
             <div className="section-header">
               <div className="section-title">
-                <span>Receipt List</span>
+                <span>{t('list.title')}</span>
                 <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-                  ({tally.processedTransfers.length} items)
+                  {t('list.items', { n: tally.processedTransfers.length })}
                 </span>
               </div>
               <input
@@ -883,7 +897,7 @@ export default function TransferTallyPage() {
                 className="day-picker-input"
                 value={selectedDate}
                 onChange={(e) => setSelectedDate(e.target.value)}
-                title="Select date for this tally"
+                title={t('list.dateTitle')}
               />
             </div>
 
@@ -891,15 +905,16 @@ export default function TransferTallyPage() {
             {transfers.length > 0 && (
               <div className="action-strip">
                 <button className="btn-primary" onClick={handleSaveDay}>
-                  💾 Save Day
+                  💾 {t('actions.saveDay')}
                 </button>
                 <button className="btn-secondary" onClick={handleExportCsv}>
-                  📥 Export CSV
+                  📥 {t('actions.exportCsv')}
                 </button>
                 <button
                   className="btn-icon-text"
                   onClick={handleClearBatch}
-                  title="Clear batch"
+                  title={t('actions.clearBatch')}
+                  aria-label={t('actions.clearBatch')}
                 >
                   🗑️
                 </button>
@@ -910,12 +925,8 @@ export default function TransferTallyPage() {
             {tally.processedTransfers.length === 0 ? (
               <div className="empty-state">
                 <div className="empty-icon">🧾</div>
-                <h3>No transfers in current batch</h3>
-                <p>
-                  Upload or photograph your customers&apos; transfer screenshots above. Telebirr,
-                  CBE, Awash and other Ethiopian receipts are read automatically, duplicates are
-                  excluded, and the day&apos;s total is calculated for you.
-                </p>
+                <h3>{t('empty.batchTitle')}</h3>
+                <p>{t('empty.batchBody')}</p>
               </div>
             ) : (
               <div className="cards-list" id="transfers-list">
@@ -940,27 +951,21 @@ export default function TransferTallyPage() {
                           </div>
                           <div>
                             <div className="bank-name">
-                              {item.bank || 'Unknown Bank'}
+                              {item.bank || t('card.unknownBank')}
                             </div>
                             <div style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
-                              #{idx + 1} • {item.date_time || 'No date'}
+                              #{idx + 1} • {item.date_time || t('card.noDate')}
                             </div>
                           </div>
                         </div>
 
                         <div className="badges-group">
                           {isDuplicate ? (
-                            <span className="badge badge-dup">
-                              ⚠️ Duplicate (Excluded)
-                            </span>
+                            <span className="badge badge-dup">{t('badge.duplicate')}</span>
                           ) : !Boolean(item.is_receipt) ? (
-                            <span className="badge badge-low">
-                              🚫 Not a Receipt (Excluded)
-                            </span>
+                            <span className="badge badge-low">{t('badge.notReceipt')}</span>
                           ) : isMissingRef ? (
-                            <span className="badge badge-low">
-                              ⚠️ Needs Ref (Excluded)
-                            </span>
+                            <span className="badge badge-low">{t('badge.needsRef')}</span>
                           ) : (
                             <span
                               className={`badge ${
@@ -972,10 +977,10 @@ export default function TransferTallyPage() {
                               }`}
                             >
                               {item.confidence === 'high'
-                                ? '✓ High'
+                                ? t('badge.high')
                                 : item.confidence === 'medium'
-                                ? '• Medium'
-                                : '⚠️ Low Confidence'}
+                                ? t('badge.medium')
+                                : t('badge.low')}
                             </span>
                           )}
                         </div>
@@ -983,36 +988,36 @@ export default function TransferTallyPage() {
 
                       {/* Amount Container */}
                       <div className="card-amount-box">
-                        <span className="amount-currency">AMOUNT (ETB)</span>
+                        <span className="amount-currency">{t('card.amount')}</span>
                         <span className="amount-value">{formatETB(item.amount)}</span>
                       </div>
 
                       {/* Details Grid */}
                       <div className="details-grid">
                         <div className="detail-item">
-                          <span className="detail-label">Reference No (Txn ID)</span>
+                          <span className="detail-label">{t('card.reference')}</span>
                           <span className="detail-value detail-ref">
-                            {item.reference_no || '(Empty - Needs Review)'}
+                            {item.reference_no || t('card.emptyRef')}
                           </span>
                         </div>
                         <div className="detail-item">
-                          <span className="detail-label">Sender (Payer)</span>
+                          <span className="detail-label">{t('card.sender')}</span>
                           <span className="detail-value">
                             {item.sender_name || '—'}
                           </span>
                         </div>
                         <div className="detail-item">
-                          <span className="detail-label">Receiver (Beneficiary)</span>
+                          <span className="detail-label">{t('card.receiver')}</span>
                           <span className="detail-value">
                             {item.receiver_name || '—'}
                           </span>
                         </div>
                         <div className="detail-item">
-                          <span className="detail-label">Receipt Status</span>
+                          <span className="detail-label">{t('card.status')}</span>
                           <span className="detail-value">
                             {item.is_receipt
-                              ? 'Payment Confirmed'
-                              : 'Not a receipt (Excluded)'}
+                              ? t('card.confirmed')
+                              : t('card.notReceiptExcluded')}
                           </span>
                         </div>
                       </div>
@@ -1026,27 +1031,31 @@ export default function TransferTallyPage() {
                               onClick={() =>
                                 setZoomedImage({
                                   url: item.image_preview!,
-                                  title: `${item.bank} - Ref: ${item.reference_no || 'No ref'}`,
+                                  title: t('preview.refTitle', {
+                                    bank: item.bank || t('card.unknownBank'),
+                                    ref: item.reference_no || t('preview.noRef'),
+                                  }),
                                 })
                               }
                             >
-                              🔍 View Receipt
+                              🔍 {t('card.viewReceipt')}
                             </button>
                           )}
                           <button
                             className="btn-icon-text"
                             onClick={() => setEditingTransfer(item)}
                           >
-                            ✏️ Edit
+                            ✏️ {t('card.edit')}
                           </button>
                         </div>
 
                         <button
                           className="btn-icon-text btn-delete"
                           onClick={() => handleDeleteTransfer(item.id)}
-                          title="Delete this row"
+                          title={t('card.deleteTitle')}
+                          aria-label={t('card.deleteTitle')}
                         >
-                          🗑️ Delete
+                          🗑️ {t('card.delete')}
                         </button>
                       </footer>
                     </article>
@@ -1059,20 +1068,17 @@ export default function TransferTallyPage() {
           /* History Tab */
           <div className="cards-list">
             <div className="section-header">
-              <div className="section-title">Saved Day Archives</div>
+              <div className="section-title">{t('history.title')}</div>
               <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-                Stored in browser localStorage
+                {t('history.storage')}
               </span>
             </div>
 
             {savedDays.length === 0 ? (
               <div className="empty-state">
                 <div className="empty-icon">📂</div>
-                <h3>No saved days yet</h3>
-                <p>
-                  At the end of the day, click &quot;Save Day&quot; in the batch tab to archive that
-                  day&apos;s transfers and total amount.
-                </p>
+                <h3>{t('history.emptyTitle')}</h3>
+                <p>{t('history.emptyBody')}</p>
               </div>
             ) : (
               savedDays.map((day) => {
@@ -1084,15 +1090,18 @@ export default function TransferTallyPage() {
                       <div>
                         <div className="history-date">📅 {day.date}</div>
                         <div style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>
-                          {day.transfer_count} valid transfers • {day.duplicate_count} duplicates
+                          {t('history.validTransfers', { n: day.transfer_count })} •{' '}
+                          {t('history.duplicates', { n: day.duplicate_count })}
                           {day.previews_stripped && (
                             <span style={{ color: '#b45309', marginLeft: '6px', fontWeight: 600 }}>
-                              • (Images removed for quota)
+                              • {t('history.imagesRemoved')}
                             </span>
                           )}
                         </div>
                       </div>
-                      <div className="history-total">ETB {formatETB(day.total_amount)}</div>
+                      <div className="history-total">
+                        {t('currency')} {formatETB(day.total_amount)}
+                      </div>
                     </div>
 
                     <div className="history-actions">
@@ -1103,7 +1112,9 @@ export default function TransferTallyPage() {
                           setExpandedHistoryDayId(isExpanded ? null : day.id)
                         }
                       >
-                        {isExpanded ? '▲ Hide Details' : '▼ Expand'}
+                        {isExpanded
+                          ? `▲ ${t('history.hideDetails')}`
+                          : `▼ ${t('history.expand')}`}
                       </button>
                       <button
                         className="btn-secondary"
@@ -1112,19 +1123,20 @@ export default function TransferTallyPage() {
                           exportTransfersToCsv(day.date, day.transfers, day.total_amount)
                         }
                       >
-                        📥 CSV
+                        📥 {t('history.csv')}
                       </button>
                       <button
                         className="btn-primary"
                         style={{ minHeight: '40px', padding: '6px 12px' }}
                         onClick={() => handleLoadDayIntoEditor(day)}
                       >
-                        Load to Editor
+                        {t('history.loadToEditor')}
                       </button>
                       <button
                         className="btn-icon-text btn-delete"
                         style={{ minHeight: '40px' }}
                         onClick={() => handleDeleteDay(day.id)}
+                        aria-label={t('card.deleteTitle')}
                       >
                         🗑️
                       </button>
@@ -1142,23 +1154,24 @@ export default function TransferTallyPage() {
                           gap: '8px',
                         }}
                       >
-                        {day.transfers.map((t, idx) => (
+                        {day.transfers.map((row, idx) => (
                           <div
-                            key={t.id || idx}
+                            key={row.id || idx}
                             style={{
                               display: 'flex',
                               justifyContent: 'space-between',
                               fontSize: '0.85rem',
                               padding: '6px 8px',
-                              background: t.is_duplicate
+                              background: row.is_duplicate
                                 ? 'var(--badge-dup-bg)'
                                 : 'var(--bg-subtle)',
                               borderRadius: '6px',
                             }}
                           >
                             <div>
-                              <strong>{t.bank}</strong> • Ref: {t.reference_no || '(Empty)'}
-                              {t.is_duplicate && (
+                              <strong>{row.bank}</strong> • {t('list.refPrefix')}{' '}
+                              {row.reference_no || t('history.emptyRef')}
+                              {row.is_duplicate && (
                                 <span
                                   style={{
                                     color: '#b91c1c',
@@ -1166,10 +1179,10 @@ export default function TransferTallyPage() {
                                     marginLeft: '6px',
                                   }}
                                 >
-                                  (Duplicate)
+                                  {t('history.duplicateTag')}
                                 </span>
                               )}
-                              {t.missing_reference && (
+                              {row.missing_reference && (
                                 <span
                                   style={{
                                     color: '#b45309',
@@ -1177,10 +1190,10 @@ export default function TransferTallyPage() {
                                     marginLeft: '6px',
                                   }}
                                 >
-                                  (Missing Ref)
+                                  {t('history.missingRefTag')}
                                 </span>
                               )}
-                              {t.is_receipt === false && (
+                              {row.is_receipt === false && (
                                 <span
                                   style={{
                                     color: '#b91c1c',
@@ -1188,12 +1201,12 @@ export default function TransferTallyPage() {
                                     marginLeft: '6px',
                                   }}
                                 >
-                                  (Not a receipt)
+                                  {t('history.notReceiptTag')}
                                 </span>
                               )}
                             </div>
                             <div style={{ fontWeight: '800' }}>
-                              ETB {formatETB(t.amount)}
+                              {t('currency')} {formatETB(row.amount)}
                             </div>
                           </div>
                         ))}
@@ -1214,14 +1227,15 @@ export default function TransferTallyPage() {
             className="modal-sheet"
             role="dialog"
             aria-modal="true"
-            aria-label="Edit transfer"
+            aria-label={t('modal.editTitle')}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="modal-header">
-              <h2>Edit Transfer</h2>
+              <h2>{t('modal.editTitle')}</h2>
               <button
                 className="btn-close"
                 onClick={() => setEditingTransfer(null)}
+                aria-label={t('form.cancel')}
               >
                 ✕
               </button>
@@ -1235,7 +1249,7 @@ export default function TransferTallyPage() {
               style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}
             >
               <div className="form-group">
-                <label className="form-label">Bank / Mobile Money Provider</label>
+                <label className="form-label">{t('form.bank')}</label>
                 <input
                   type="text"
                   className="form-input"
@@ -1254,7 +1268,7 @@ export default function TransferTallyPage() {
               </div>
 
               <div className="form-group">
-                <label className="form-label">Transferred Amount (ETB)</label>
+                <label className="form-label">{t('form.amount')}</label>
                 <input
                   type="number"
                   step="0.01"
@@ -1272,7 +1286,7 @@ export default function TransferTallyPage() {
               </div>
 
               <div className="form-group">
-                <label className="form-label">Reference Number (Txn ID)</label>
+                <label className="form-label">{t('form.reference')}</label>
                 <input
                   type="text"
                   className="form-input"
@@ -1283,13 +1297,13 @@ export default function TransferTallyPage() {
                       reference_no: e.target.value,
                     })
                   }
-                  placeholder="e.g. TLB88941203"
+                  placeholder={t('form.referencePlaceholder')}
                   required
                 />
               </div>
 
               <div className="form-group">
-                <label className="form-label">Sender Name (Payer)</label>
+                <label className="form-label">{t('form.sender')}</label>
                 <input
                   type="text"
                   className="form-input"
@@ -1304,7 +1318,7 @@ export default function TransferTallyPage() {
               </div>
 
               <div className="form-group">
-                <label className="form-label">Receiver Name</label>
+                <label className="form-label">{t('form.receiver')}</label>
                 <input
                   type="text"
                   className="form-input"
@@ -1319,7 +1333,7 @@ export default function TransferTallyPage() {
               </div>
 
               <div className="form-group">
-                <label className="form-label">Date / Time</label>
+                <label className="form-label">{t('form.dateTime')}</label>
                 <input
                   type="text"
                   className="form-input"
@@ -1334,7 +1348,7 @@ export default function TransferTallyPage() {
               </div>
 
               <div className="form-group">
-                <label className="form-label">Is this a payment receipt?</label>
+                <label className="form-label">{t('form.isReceipt')}</label>
                 <select
                   className="form-input"
                   value={editingTransfer.is_receipt ? 'yes' : 'no'}
@@ -1345,13 +1359,13 @@ export default function TransferTallyPage() {
                     })
                   }
                 >
-                  <option value="yes">Yes — count in the total</option>
-                  <option value="no">No — not a receipt (excluded)</option>
+                  <option value="yes">{t('form.isReceiptYes')}</option>
+                  <option value="no">{t('form.isReceiptNo')}</option>
                 </select>
               </div>
 
               <div className="form-group">
-                <label className="form-label">Confidence</label>
+                <label className="form-label">{t('form.confidence')}</label>
                 <select
                   className="form-input"
                   value={editingTransfer.confidence}
@@ -1362,22 +1376,22 @@ export default function TransferTallyPage() {
                     })
                   }
                 >
-                  <option value="high">High (Certain)</option>
-                  <option value="medium">Medium</option>
-                  <option value="low">Low (Needs verification)</option>
+                  <option value="high">{t('form.confidenceHigh')}</option>
+                  <option value="medium">{t('form.confidenceMedium')}</option>
+                  <option value="low">{t('form.confidenceLow')}</option>
                 </select>
               </div>
 
               <div style={{ display: 'flex', gap: '10px', marginTop: '10px' }}>
                 <button type="submit" className="btn-primary">
-                  💾 Save Changes
+                  💾 {t('form.save')}
                 </button>
                 <button
                   type="button"
                   className="btn-secondary"
                   onClick={() => setEditingTransfer(null)}
                 >
-                  Cancel
+                  {t('form.cancel')}
                 </button>
               </div>
             </form>
@@ -1392,12 +1406,16 @@ export default function TransferTallyPage() {
             className="modal-sheet"
             role="dialog"
             aria-modal="true"
-            aria-label="Receipt preview"
+            aria-label={t('preview.aria')}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="modal-header">
               <h2>{zoomedImage.title}</h2>
-              <button className="btn-close" onClick={() => setZoomedImage(null)}>
+              <button
+                className="btn-close"
+                onClick={() => setZoomedImage(null)}
+                aria-label={t('form.cancel')}
+              >
                 ✕
               </button>
             </div>
@@ -1405,7 +1423,7 @@ export default function TransferTallyPage() {
               {/* eslint-disable-next-line @next/next/no-img-element -- src is a runtime data URL / blob preview; next/image does not optimize those and would add no value here */}
               <img
                 src={zoomedImage.url}
-                alt="Receipt Full Preview"
+                alt={t('preview.aria')}
                 className="image-zoom-img"
               />
             </div>

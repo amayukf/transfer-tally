@@ -230,6 +230,30 @@ button, input, select, textarea {
   50% { opacity: 0.8; }
 }
 
+/* Small status pills in the total bar */
+.total-pill {
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+  font-size: 0.72rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.total-pill-warn {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+.total-pill-danger {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.total-pill-review {
+  background: #fef3c7;
+  color: #92400e;
+}
+
 /* Nav Tabs */
 .nav-tabs {
   display: flex;
@@ -306,6 +330,34 @@ button, input, select, textarea {
 }
 
 .theme-toggle-btn:active {
+  transform: scale(0.95);
+}
+
+/* Header controls cluster (language + theme) */
+.header-actions-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.lang-toggle-btn {
+  min-width: 48px;
+  height: 44px;
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md);
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  color: var(--text-muted);
+  font-weight: 800;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.lang-toggle-btn:active {
   transform: scale(0.95);
 }
 
