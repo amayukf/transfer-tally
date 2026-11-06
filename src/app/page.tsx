@@ -19,6 +19,7 @@ import {
   deleteDayRecord,
   exportTransfersToCsv,
 } from '@/utils/storage';
+import { extractWithOcr, terminateOcrWorker } from '@/utils/ocr';
 
 const MAX_UPLOAD_FILE_SIZE = 15 * 1024 * 1024; // 15MB file cap
 const MAX_EXTRACTION_ATTEMPTS = 3; // 1 initial request + up to 2 retries
@@ -66,6 +67,24 @@ type ExtractionAttempt =
   | { kind: 'fatal'; message: string };
 
 /**
+ * How receipt data is read:
+ * - 'on-device': local OCR only. Images are never sent to AI (free + private),
+ *   and anything unreadable is left for the cashier to type.
+ * - 'hybrid': local OCR first; the AI extractor is called only when OCR cannot
+ *   confidently read the amount + reference.
+ * - 'ai': always use the Gemini extractor (most accurate, uses quota).
+ */
+type ExtractionMode = 'on-device' | 'hybrid' | 'ai';
+
+const EXTRACTION_MODE_STORAGE_KEY = 'tt_extraction_mode';
+
+function readStoredExtractionMode(): ExtractionMode {
+  if (typeof window === 'undefined') return 'hybrid';
+  const raw = localStorage.getItem(EXTRACTION_MODE_STORAGE_KEY);
+  return raw === 'on-device' || raw === 'hybrid' || raw === 'ai' ? raw : 'hybrid';
+}
+
+/**
  * Performs a single extraction request and classifies the outcome so the caller
  * can decide whether retrying is worthwhile (rate limits, server faults and
  * network failures) or pointless (validation / configuration errors).
@@ -91,6 +110,13 @@ async function requestExtraction(
       errJson && typeof errJson.error === 'string'
         ? errJson.error
         : `Extraction request failed (HTTP ${res.status}).`;
+
+    // A missing API key is a configuration problem, not a transient fault —
+    // never worth retrying (the AI fallback is optional, so this is expected
+    // when the cashier runs without a Gemini key).
+    if (errJson && errJson.missingApiKey) {
+      return { kind: 'fatal', message };
+    }
 
     // 429 (rate limit) and 5xx (transient server faults) are worth retrying.
     if (res.status === 429 || res.status >= 500) {
@@ -122,6 +148,9 @@ export default function TransferTallyPage() {
 
   // Theme: 'light' | 'dark'
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
+
+  // Extraction mode: on-device OCR only, OCR + AI fallback, or AI only.
+  const [extractionMode, setExtractionMode] = useState<ExtractionMode>('hybrid');
 
   // Day context (defaults to local YYYY-MM-DD)
   const [selectedDate, setSelectedDate] = useState<string>('');
@@ -194,6 +223,7 @@ export default function TransferTallyPage() {
     const timer = setTimeout(() => {
       setSelectedDate(getLocalTodayDateString());
       refreshHistoricalData();
+      setExtractionMode(readStoredExtractionMode());
 
       const savedTheme = localStorage.getItem('tt_theme') as 'light' | 'dark' | null;
       if (savedTheme) {
@@ -212,6 +242,8 @@ export default function TransferTallyPage() {
       if (toastTimerRef.current) {
         clearTimeout(toastTimerRef.current);
       }
+      // Release the OCR worker (if one was ever started) on unmount.
+      void terminateOcrWorker();
     };
   }, [refreshHistoricalData]);
 
@@ -220,6 +252,15 @@ export default function TransferTallyPage() {
     setTheme(next);
     localStorage.setItem('tt_theme', next);
     document.documentElement.setAttribute('data-theme', next);
+  };
+
+  const changeExtractionMode = (mode: ExtractionMode) => {
+    setExtractionMode(mode);
+    try {
+      localStorage.setItem(EXTRACTION_MODE_STORAGE_KEY, mode);
+    } catch {
+      // Ignore storage failures (private mode / quota) — mode still applies.
+    }
   };
 
   // Recompute tally and duplicates strictly in code
@@ -268,49 +309,82 @@ export default function TransferTallyPage() {
         // 1. Client-side canvas resize (max 1400px, JPEG 0.85)
         const resized = await resizeImageForUpload(file, 1400, 0.85);
 
-        // 2. Call /api/extract, retrying transient failures with a 5s backoff
         let result: GeminiExtractionResponse | null = null;
 
-        for (let attempt = 1; attempt <= MAX_EXTRACTION_ATTEMPTS; attempt++) {
-          setProcessingStatus(
-            `Scanning receipt ${i + 1} of ${validFiles.length} with AI...`
-          );
-
-          const outcome = await requestExtraction(
-            resized.base64,
-            resized.mimeType,
-            file.name
-          );
-
-          if (outcome.kind === 'success') {
-            result = outcome.data;
-            break;
-          }
-
-          // Validation / configuration errors will never succeed on retry.
-          if (outcome.kind === 'fatal' || attempt >= MAX_EXTRACTION_ATTEMPTS) {
-            throw new Error(outcome.message);
-          }
-
-          // Wait as long as the server asked (rate-limit cooldown), bounded so a
-          // large nightly batch never stalls too long on a single image.
-          const waitSeconds = Math.min(
-            Math.max(outcome.retryAfterSeconds ?? RETRY_BACKOFF_SECONDS, 2),
-            30
-          );
-          setRetryAttempt(attempt);
-          for (let sec = waitSeconds; sec > 0; sec--) {
+        // 2. On-device OCR first: free, private and quota-free. Skipped only in
+        //    AI-only mode. The image is read locally and never uploaded here.
+        if (extractionMode !== 'ai') {
+          try {
             setProcessingStatus(
-              `Extraction service busy. Retrying in ${sec}s (attempt ${
-                attempt + 1
-              } of ${MAX_EXTRACTION_ATTEMPTS})...`
+              `Reading receipt ${i + 1} of ${validFiles.length} on-device...`
             );
-            await sleep(1000);
+            const ocr = await extractWithOcr(resized.dataUrl, (p) => {
+              setProcessingStatus(
+                `Reading receipt ${i + 1} of ${validFiles.length} on-device... ${Math.round(
+                  p * 100
+                )}%`
+              );
+            });
+            // Keep the on-device read when it clearly found amount + reference,
+            // or when the cashier chose never to send images to AI.
+            if (ocr.reliable || extractionMode === 'on-device') {
+              result = ocr.fields;
+            }
+          } catch (ocrErr) {
+            console.warn(`On-device OCR failed for ${file.name}:`, ocrErr);
+            if (extractionMode === 'on-device') {
+              throw new Error(
+                'On-device reading is unavailable (it needs internet the first time).'
+              );
+            }
+            // hybrid mode: fall through to the AI extractor below.
           }
-          setRetryAttempt(null);
         }
 
-        // 3. Create transfer record with crypto ID
+        // 3. AI fallback: used in AI-only mode, and in hybrid mode when the
+        //    on-device read was not confident. Never used in on-device mode.
+        if (!result) {
+          for (let attempt = 1; attempt <= MAX_EXTRACTION_ATTEMPTS; attempt++) {
+            setProcessingStatus(
+              `Scanning receipt ${i + 1} of ${validFiles.length} with AI...`
+            );
+
+            const outcome = await requestExtraction(
+              resized.base64,
+              resized.mimeType,
+              file.name
+            );
+
+            if (outcome.kind === 'success') {
+              result = outcome.data;
+              break;
+            }
+
+            // Validation / configuration errors will never succeed on retry.
+            if (outcome.kind === 'fatal' || attempt >= MAX_EXTRACTION_ATTEMPTS) {
+              throw new Error(outcome.message);
+            }
+
+            // Wait as long as the server asked (rate-limit cooldown), bounded so a
+            // large nightly batch never stalls too long on a single image.
+            const waitSeconds = Math.min(
+              Math.max(outcome.retryAfterSeconds ?? RETRY_BACKOFF_SECONDS, 2),
+              30
+            );
+            setRetryAttempt(attempt);
+            for (let sec = waitSeconds; sec > 0; sec--) {
+              setProcessingStatus(
+                `Extraction service busy. Retrying in ${sec}s (attempt ${
+                  attempt + 1
+                } of ${MAX_EXTRACTION_ATTEMPTS})...`
+              );
+              await sleep(1000);
+            }
+            setRetryAttempt(null);
+          }
+        }
+
+        // 4. Create transfer record with crypto ID
         const record: TransferRecord = {
           id: generateTransferId(),
           bank: result?.bank || 'Unknown Bank',
@@ -725,6 +799,22 @@ export default function TransferTallyPage() {
                 Or share straight from your gallery: select the screenshots →
                 Share → Transfer Tally.
               </p>
+
+              <div className="extraction-mode-row">
+                <label htmlFor="extraction-mode">Scan mode</label>
+                <select
+                  id="extraction-mode"
+                  value={extractionMode}
+                  onChange={(e) =>
+                    changeExtractionMode(e.target.value as ExtractionMode)
+                  }
+                  disabled={isProcessing}
+                >
+                  <option value="hybrid">On-device + AI fallback (best accuracy)</option>
+                  <option value="on-device">On-device only (no AI, private)</option>
+                  <option value="ai">AI only</option>
+                </select>
+              </div>
             </section>
 
             {/* Processing Progress Bar & Status */}

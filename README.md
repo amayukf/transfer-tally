@@ -11,7 +11,9 @@ Built with **Next.js (App Router)** + **TypeScript** + **Plain CSS**. Uses **onl
 - **📱 Mobile-First PWA**: Installable on iPhone and Android (`standalone` display, theme color `#0f766e`, offline service worker shell).
 - **📤 Share-to-App Import (Android)**: Once installed, Transfer Tally appears in the phone's Share sheet. The cashier selects the whole day's screenshots in the gallery, taps **Share → Transfer Tally**, and the scan starts automatically — no file picker, no tapping images one by one.
 - **⚡ Client-Side Canvas Compression**: Automatically resizes screenshots on the device to max 1400px at JPEG 0.85 before uploading for ultra-fast transfers and minimal data usage.
-- **🤖 Free-Tier Gemini AI Extraction**: Calls Google Gemini (`gemini-3.8-flash`) via REST API with strict JSON schema validation.
+- **🔍 On-Device OCR (no AI)**: Receipts are read locally in the browser with Tesseract.js (WASM) and parsed with per-bank rules. The image never leaves the phone — no API key, no quota, and it works offline once the OCR engine is cached.
+- **🎚️ Selectable Scan Mode**: A **Scan mode** selector in the upload card lets the cashier choose **On-device + AI fallback** (default — OCR first, AI only when a receipt can't be read confidently), **On-device only** (fully private, zero cost), or **AI only** (most accurate). The choice is remembered on the device.
+- **🤖 Free-Tier Gemini AI Extraction (fallback)**: Calls Google Gemini (`gemini-3.8-flash`) via REST API with strict JSON schema validation. Only used in *hybrid* mode when OCR is unsure, or in *AI only* mode — so a normal night uses a fraction of the free quota.
 - **🔄 Resilient Extraction Retries**: Automatically retries when the extraction service is rate-limited (429) or temporarily unavailable, honouring the server's own cooldown hint (`Retry-After`). Requests that can never succeed (invalid image, missing API key) fail immediately with the exact reason shown to the cashier.
 - **🔀 Automatic Model Fallback**: If Google's primary flash model answers 503 ("high demand"), the server transparently retries the same extraction on the configured fallback models (`gemini-3.6-flash` → `gemini-3.5-flash` by default, tunable via `GEMINI_FALLBACK_MODELS`) so the cashier's nightly close never stalls on a capacity blip.
 - **🛡️ Duplicate Detection Engine**:
@@ -29,6 +31,8 @@ Built with **Next.js (App Router)** + **TypeScript** + **Plain CSS**. Uses **onl
 ---
 
 ## 🔑 How to Get a Free Gemini API Key
+
+> **Optional.** With the default *On-device + AI fallback* mode the app works without any key for most receipts; **On-device only** mode never needs one. The key only enables the AI fallback (and *AI only* mode).
 
 1. Go to [Google AI Studio](https://aistudio.google.com/apikey).
 2. Sign in with any free Google account.
