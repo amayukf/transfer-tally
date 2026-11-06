@@ -54,12 +54,11 @@ function createWorkerFor(slot: PoolSlot): Promise<TesseractWorker> {
           }
         },
       });
-      // A receipt is one dense text block, so keep lines intact instead of
-      // letting Tesseract re-segment them. Preserving inter-word spacing keeps
-      // "Amount 1,250.00" together on one line for the parser, and a declared
-      // DPI stops it from guessing a resolution that hurts digit accuracy.
+      // Mobile receipt screenshots contain several regions (header, amount,
+      // details, QR/footer, and sometimes keyboard/UI chrome), so let Tesseract
+      // segment the page instead of treating the entire screenshot as one block.
       await worker.setParameters({
-        tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
+        tessedit_pageseg_mode: PSM.AUTO,
         preserve_interword_spaces: '1',
         user_defined_dpi: '300',
       });

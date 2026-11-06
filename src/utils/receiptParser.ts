@@ -90,7 +90,7 @@ function toNumber(token: string): number | null {
 const AMOUNT_LABEL_TRANSFERRED = [/transferred/i, /የተላለፈ/, /ተላልፏል/];
 const AMOUNT_LABEL_AMOUNT = [/\bamount\b/i, /መጠን/];
 const AMOUNT_LABEL_TOTAL = [/\btotal\b/i, /ጠቅላላ/, /ገንዘብ/];
-const CURRENCY_TOKENS = [/\betb\b/i, /\bbr\b/i, /ብር/];
+const CURRENCY_TOKENS = [/\betb(?![a-z])/i, /\bbr(?![a-z])/i, /ብር/];
 
 // Lines that mention a figure but are NOT the transfer amount. Kept fee/VAT/
 // balance-focused so we never add a service charge to the day's total.
@@ -117,7 +117,7 @@ const INCLUSIVE_TOTAL_LABEL =
   /(?:\b(?:total|amount)\b.{0,32}\b(?:including|incl\.?|with)\b.{0,16}\b(?:fee|charge|commission)\b|\b(?:fee|charge|commission)\b.{0,16}\b(?:included|inclusive)\b)/i;
 const AMOUNT_METADATA_LABEL = /\b(?:date|time|transaction\s*(?:date|time|id|no|number)|reference|ref(?:erence)?|txn|receipt\s*(?:no|number))\b/i;
 const DATE_OR_TIME_VALUE =
-  /\b\d{4}[/. -]\d{1,2}[/. -]\d{1,2}\b|\b\d{1,2}:\d{2}(?::\d{2})?\b/;
+  /\b\d{4}[/. -]\d{1,2}[/. -]\d{1,2}\b|\b\d{1,2}[/. -]\d{1,2}[/. -]\d{4}\b|\b\d{1,2}:\d{2}(?::\d{2})?\b/;
 
 function extractNumbers(line: string): number[] {
   const amountText = line
@@ -125,9 +125,12 @@ function extractNumbers(line: string): number[] {
       /\b(?:transaction\s*(?:id|no|number)|reference(?:\s*(?:no|number|id))?|ref(?:\s*(?:no|number|id))?|txn|receipt\s*(?:no|number))\s*[:#]?\s*[A-Z0-9-]+/gi,
       ' '
     )
+    .replace(/\b(?:TB[0-9A-Z]{6,}|FT[0-9A-Z]{6,}|[A-Z]{2,4}\d{6,}[A-Z0-9]*)\b/gi, ' ')
     .replace(/\b(?:account|phone|mobile)\s*(?:no|number)?\s*[:#]?\s*\+?[\d*().\s-]{5,}/gi, ' ')
     .replace(/\b[A-Z]{2,4}-\d\*+\d+\b/gi, ' ')
+    .replace(/\b[A-Za-z][A-Za-z-]*-\d{4,}\b/g, ' ')
     .replace(/\b\d{4}[/. -]\d{1,2}[/. -]\d{1,2}\b/g, ' ')
+    .replace(/\b\d{1,2}[/. -]\d{1,2}[/. -]\d{4}\b/g, ' ')
     .replace(
       /\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2},?\s+\d{4}\b/gi,
       ' '
@@ -153,7 +156,12 @@ function amountLabelPriority(line: string): number {
   return 0;
 }
 
-function findAmount(lines: string[]): number | null {
+interface FoundAmount {
+  value: number;
+  priority: number;
+}
+
+function findAmount(lines: string[]): FoundAmount | null {
   const candidates: Array<{ value: number; priority: number; includesFee: boolean }> = [];
   let explicitFeeTotal = 0;
 
@@ -248,10 +256,23 @@ function findAmount(lines: string[]): number | null {
   // Highest-priority label wins; ties broken by the largest amount.
   candidates.sort((a, b) => b.priority - a.priority || b.value - a.value);
   const selected = candidates[0];
-  if (!selected.includesFee) return selected.value;
+  if (
+    selected.priority === 1 &&
+    new Set(candidates.filter((candidate) => candidate.priority === 1).map((candidate) => candidate.value))
+      .size > 1
+  ) {
+    // Several unlabeled numbers (for example, keyboard digits) are not enough
+    // evidence to safely choose a transfer amount.
+    return null;
+  }
+  if (!selected.includesFee) {
+    return { value: selected.value, priority: selected.priority };
+  }
   // Subtract only a separately recognized fee from a total explicitly marked
   // as fee-inclusive. Without both signals, leave the value for manual review.
-  return explicitFeeTotal > 0 ? Math.max(0, selected.value - explicitFeeTotal) : null;
+  return explicitFeeTotal > 0
+    ? { value: Math.max(0, selected.value - explicitFeeTotal), priority: selected.priority }
+    : null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -382,7 +403,8 @@ export function parseReceiptText(rawText: string): ParsedReceipt {
     .filter(Boolean);
 
   const bank = detectBank(text) || '';
-  const amount = findAmount(lines);
+  const amountResult = findAmount(lines);
+  const amount = amountResult?.value ?? null;
   const reference = findReference(text, lines, amount);
   const dateTime = findDateTime(text);
   const senderName = findParty(lines, [/\bfrom\b/i, /\bsender\b/i, /\bpayer\b/i, /ከ/]);
@@ -395,13 +417,14 @@ export function parseReceiptText(rawText: string): ParsedReceipt {
   ]);
 
   const hasAmount = amount !== null && amount > 0;
+  const hasStrongAmount = amountResult !== null && amountResult.priority >= 2;
   const hasReference = !!reference && reference.length >= 6;
 
   const looksLikeReceipt =
     (hasAmount && hasReference) || RECEIPT_KEYWORDS.some((re) => re.test(text));
 
   let confidence: ConfidenceLevel = 'low';
-  if (hasAmount && hasReference) {
+  if (hasStrongAmount && hasReference) {
     confidence = bank ? 'high' : 'medium';
   }
 
@@ -418,7 +441,7 @@ export function parseReceiptText(rawText: string): ParsedReceipt {
 
   return {
     fields,
-    reliable: hasAmount && hasReference,
+    reliable: hasStrongAmount && hasReference,
     matched: {
       bank: !!bank,
       amount: hasAmount,

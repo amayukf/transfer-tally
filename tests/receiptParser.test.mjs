@@ -73,3 +73,32 @@ test('reads the CBE receipt amount and transaction ID with fee and VAT rows', ()
   assert.equal(result.fields.reference_no, 'FT26309W04V');
   assert.equal(result.fields.bank, 'Commercial Bank of Ethiopia (CBE)');
 });
+
+test('reads an amount glued to ETB and ignores a date and unlabeled FT reference', () => {
+  const receipt = [
+    'Completed ETB50.00 transfer From Ahmed Taha Siraj to Rebuma Teka Ligd-6298.',
+    'To transfer on 02/11/2026 FT26307FYG7 Service Charge 0.0 VAT(15%)0.0 1:Back',
+  ].join('\n');
+
+  const result = parseReceiptText(receipt);
+
+  assert.equal(result.fields.amount, 50);
+  assert.equal(result.fields.reference_no, 'FT26307FYG7');
+});
+
+test('does not guess from multiple unlabeled numbers such as keyboard digits', () => {
+  const receipt = [
+    'Transfer completed',
+    '1 2 3 4 5 6 7 8 9 0',
+  ].join('\n');
+
+  assert.equal(parseReceiptText(receipt).fields.amount, 0);
+});
+
+test('marks an unlabeled amount as unverified even when a reference exists', () => {
+  const result = parseReceiptText('Transfer completed 123\nTransaction ID: FT12345678');
+
+  assert.equal(result.fields.amount, 123);
+  assert.equal(result.fields.confidence, 'low');
+  assert.equal(result.reliable, false);
+});
