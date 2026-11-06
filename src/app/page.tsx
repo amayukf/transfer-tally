@@ -19,7 +19,7 @@ import {
   deleteDayRecord,
   exportTransfersToCsv,
 } from '@/utils/storage';
-import { extractWithOcr, terminateOcrWorker } from '@/utils/ocr';
+import { extractWithOcr, getOcrConcurrency, prewarmOcr, terminateOcrWorker } from '@/utils/ocr';
 
 const MAX_UPLOAD_FILE_SIZE = 15 * 1024 * 1024; // 15MB file cap
 const MAX_EXTRACTION_ATTEMPTS = 3; // 1 initial request + up to 2 retries
@@ -220,6 +220,10 @@ export default function TransferTallyPage() {
 
   // Initialize theme, today's local date, and load historical data on mount
   useEffect(() => {
+    // Start downloading the OCR engine right away: the first scan should not
+    // stall on a ~15MB download while the cashier waits.
+    prewarmOcr();
+
     const timer = setTimeout(() => {
       setSelectedDate(getLocalTodayDateString());
       refreshHistoricalData();
@@ -269,7 +273,8 @@ export default function TransferTallyPage() {
   }, [transfers, historicalRefs]);
 
   /**
-   * Sequential upload and extraction with canvas resize and 429 retries.
+   * Batch upload and extraction with canvas resize, parallel on-device OCR and
+   * 429 retries for the optional AI fallback.
    */
   const processFilesSequentially = async (files: File[]) => {
     if (!files.length) return;
@@ -298,11 +303,16 @@ export default function TransferTallyPage() {
     setProgressTotal(validFiles.length);
     setProgressCurrent(0);
 
-    const newExtractedTransfers: TransferRecord[] = [];
+    // Read the batch with a small pool: up to getOcrConcurrency() images are
+    // resized and OCR'd at the same time, so a night's screenshots finish in a
+    // fraction of the sequential time. Results are written back by index to
+    // preserve the order the cashier selected them in.
+    const newExtractedTransfers: TransferRecord[] = new Array(validFiles.length);
+    let nextIndex = 0;
+    let completed = 0;
 
-    for (let i = 0; i < validFiles.length; i++) {
+    const processOne = async (i: number): Promise<void> => {
       const file = validFiles[i];
-      setProgressCurrent(i + 1);
       setProcessingStatus(`Resizing & preparing receipt ${i + 1} of ${validFiles.length}...`);
 
       try {
@@ -400,12 +410,12 @@ export default function TransferTallyPage() {
           created_at: new Date().toISOString(),
         };
 
-        newExtractedTransfers.push(record);
+        newExtractedTransfers[i] = record;
       } catch (err: unknown) {
         console.error(`Error processing ${file.name}:`, err);
         const reason = err instanceof Error ? err.message : 'unknown error';
         // Add card with low confidence so cashier can enter data manually
-        newExtractedTransfers.push({
+        newExtractedTransfers[i] = {
           id: generateTransferId(),
           bank: 'Unknown / Review Required',
           amount: 0,
@@ -417,10 +427,25 @@ export default function TransferTallyPage() {
           is_receipt: false,
           file_name: file.name,
           created_at: new Date().toISOString(),
-        });
+        };
         showToast(`Could not read ${file.name}: ${reason} Added it for manual entry.`);
+      } finally {
+        completed++;
+        setProgressCurrent(completed);
       }
-    }
+    };
+
+    const concurrency = Math.min(getOcrConcurrency(), validFiles.length);
+    await Promise.all(
+      Array.from({ length: concurrency }, async () => {
+        while (true) {
+          // The increment is synchronous, so two loops never take the same index.
+          const i = nextIndex++;
+          if (i >= validFiles.length) return;
+          await processOne(i);
+        }
+      })
+    );
 
     // Append to batch
     setTransfers((prev) => [...prev, ...newExtractedTransfers]);

@@ -79,20 +79,17 @@ function toNumber(token: string): number | null {
 /* Amount detection                                                    */
 /* ------------------------------------------------------------------ */
 
-const AMOUNT_POSITIVE = [
-  /amount/i,
-  /transferred/i,
-  /transfer\s*amount/i,
-  /\btotal\b/i,
-  /\betb\b/i,
-  /\bbr\b/i,
-  /ብር/,
-  /የተላለፈ/,
-  /ገንዘብ/,
-];
+// The transferred amount is what the ledger needs — never the fee or the
+// balance. Labels are graded so "Transferred Amount" beats "Amount", which
+// beats "Total", which beats a bare currency figure.
+const AMOUNT_LABEL_TRANSFERRED = [/transferred/i, /የተላለፈ/, /ተላልፏል/];
+const AMOUNT_LABEL_AMOUNT = [/\bamount\b/i, /መጠን/];
+const AMOUNT_LABEL_TOTAL = [/\btotal\b/i, /ጠቅላላ/, /ገንዘብ/];
+const CURRENCY_TOKENS = [/\betb\b/i, /\bbr\b/i, /ብር/];
 
-// Lines that mention a currency figure but are NOT the transfer amount.
-const AMOUNT_NEGATIVE = [
+// Lines that mention a figure but are NOT the transfer amount. Kept fee/VAT/
+// balance-focused so we never add a service charge to the day's total.
+const AMOUNT_EXCLUDE = [
   /fee/i,
   /vat/i,
   /\btax\b/i,
@@ -101,35 +98,70 @@ const AMOUNT_NEGATIVE = [
   /commission/i,
   /balance/i,
   /remaining/i,
+  /available/i,
   /ክፍያ/,
   /ተቀማጭ/,
   /አገልግሎት/,
+  /account\s*(?:no|number)/i,
+  /phone\s*(?:no|number)?/i,
+  /\bmobile\b/i,
 ];
 
+function extractNumbers(line: string): number[] {
+  const raw = line.match(NUMBER_RE) || [];
+  const out: number[] = [];
+  for (const t of raw) {
+    const v = toNumber(t);
+    // Reject implausible transfer amounts (phone/account/year fragments).
+    if (v !== null && v > 0 && v <= 5_000_000) out.push(v);
+  }
+  return out;
+}
+
+function amountLabelPriority(line: string): number {
+  if (AMOUNT_LABEL_TRANSFERRED.some((re) => re.test(line))) return 4;
+  // Checked before the generic "amount" so a fee-inclusive "Total Amount" line
+  // is down-ranked below a plain "Amount" line.
+  if (AMOUNT_LABEL_TOTAL.some((re) => re.test(line))) return 2;
+  if (AMOUNT_LABEL_AMOUNT.some((re) => re.test(line))) return 3;
+  if (CURRENCY_TOKENS.some((re) => re.test(line))) return 1;
+  return 0;
+}
+
 function findAmount(lines: string[]): number | null {
-  type Candidate = { value: number; priority: number };
-  const candidates: Candidate[] = [];
+  const candidates: Array<{ value: number; priority: number }> = [];
 
-  for (const line of lines) {
-    const numbers = line.match(NUMBER_RE);
-    if (!numbers) continue;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    let priority = amountLabelPriority(line);
+    let numbers = extractNumbers(line);
 
-    const isNegative = AMOUNT_NEGATIVE.some((re) => re.test(line));
-    const isPositive = AMOUNT_POSITIVE.some((re) => re.test(line));
-    if (isNegative && !isPositive) continue;
-
-    for (const raw of numbers) {
-      const value = toNumber(raw);
-      if (value === null || value <= 0) continue;
-      // Reject implausible values (phone fragments, years, ref chunks).
-      if (value > 5_000_000) continue;
-      candidates.push({ value, priority: isPositive ? 2 : 1 });
+    // Label on this line, value on one of the next two lines (common layout).
+    if (numbers.length === 0 && priority > 0) {
+      for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
+        const nextNumbers = extractNumbers(lines[j]);
+        if (nextNumbers.length > 0) {
+          numbers = nextNumbers;
+          break;
+        }
+        // Stop if the next line is itself a different labelled figure.
+        if (amountLabelPriority(lines[j]) > 0 || AMOUNT_EXCLUDE.some((re) => re.test(lines[j]))) {
+          break;
+        }
+      }
     }
+
+    if (numbers.length === 0) continue;
+    // Skip fee/VAT/balance lines unless they explicitly say "transferred".
+    if (AMOUNT_EXCLUDE.some((re) => re.test(line)) && priority < 4) continue;
+    if (priority === 0) priority = 1; // bare number with no label at all
+
+    for (const value of numbers) candidates.push({ value, priority });
   }
 
   if (candidates.length === 0) return null;
 
-  // Prefer keyword-adjacent amounts, then the largest value on those lines.
+  // Highest-priority label wins; ties broken by the largest amount.
   candidates.sort((a, b) => b.priority - a.priority || b.value - a.value);
   return candidates[0].value;
 }
@@ -150,6 +182,14 @@ const REF_LABELS = [
 const PHONE_RE = /^(?:\+?251|0)9\d{8}$/;
 const DATEISH_RE = /^\d{1,4}[\/.-]\d{1,2}[\/.-]\d{1,4}$/;
 
+// Well-known transaction-reference shapes used by the common banks/apps. These
+// are the strongest possible signal for the duplicate-check field.
+const BANK_REF_PATTERNS = [
+  /\bTB[0-9A-Z]{6,}\b/i, // Telebirr
+  /\bFT[0-9A-Z]{6,}\b/i, // CBE / interbank transfers
+  /\b[A-Z]{2,4}\d{6,}[A-Z0-9]*\b/i, // generic letter-prefixed ref
+];
+
 function scoreReferenceToken(token: string): number {
   if (token.length < 6 || token.length > 40) return 0;
   if (PHONE_RE.test(token)) return 0;
@@ -164,29 +204,42 @@ function scoreReferenceToken(token: string): number {
   return score;
 }
 
-function findReference(text: string, lines: string[]): string | null {
-  let best: { token: string; score: number } | null = null;
+function findReference(text: string, lines: string[], amount: number | null): string | null {
+  const candidates: Array<{ token: string; score: number }> = [];
+  const consider = (token: string, bonus: number): void => {
+    const base = scoreReferenceToken(token);
+    if (base <= 0) return;
+    // Never mistake the transfer amount itself for the reference.
+    if (amount !== null && toNumber(token) === amount) return;
+    candidates.push({ token, score: base + bonus });
+  };
 
-  // 1. Tokens sitting right after a "Transaction ID / Ref No" style label.
-  for (const line of lines) {
-    if (!REF_LABELS.some((re) => re.test(line))) continue;
-    const tokens = line.match(/[A-Za-z0-9]{6,}/g) || [];
-    for (const token of tokens) {
-      const score = scoreReferenceToken(token) + 100; // labelled -> strong boost
-      if (score > 0 && (!best || score > best.score)) best = { token, score };
+  // 1. Bank-specific reference formats anywhere in the receipt.
+  for (const re of BANK_REF_PATTERNS) {
+    const match = text.match(re);
+    if (match) consider(match[0], 150);
+  }
+
+  // 2. Tokens right after a "Transaction ID / Ref No" label, checking both the
+  //    label line and the line below it (values often sit on the next line).
+  for (let i = 0; i < lines.length; i++) {
+    if (!REF_LABELS.some((re) => re.test(lines[i]))) continue;
+    for (const line of [lines[i], lines[i + 1]]) {
+      if (!line) continue;
+      for (const token of line.match(/[A-Za-z0-9]{6,}/g) || []) {
+        consider(token, 200);
+      }
     }
   }
 
-  // 2. Fallback: any long alphanumeric token in the whole receipt.
-  if (!best) {
-    const tokens = text.match(/[A-Za-z0-9]{8,}/g) || [];
-    for (const token of tokens) {
-      const score = scoreReferenceToken(token);
-      if (score > 0 && (!best || score > best.score)) best = { token, score };
-    }
+  // 3. Fallback: any long alphanumeric token in the whole receipt.
+  for (const token of text.match(/[A-Za-z0-9]{8,}/g) || []) {
+    consider(token, 0);
   }
 
-  return best ? best.token : null;
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0].token;
 }
 
 /* ------------------------------------------------------------------ */
@@ -242,7 +295,7 @@ export function parseReceiptText(rawText: string): ParsedReceipt {
 
   const bank = detectBank(text) || '';
   const amount = findAmount(lines);
-  const reference = findReference(text, lines);
+  const reference = findReference(text, lines, amount);
   const dateTime = findDateTime(text);
   const senderName = findParty(lines, [/\bfrom\b/i, /\bsender\b/i, /\bpayer\b/i, /ከ/]);
   const receiverName = findParty(lines, [
