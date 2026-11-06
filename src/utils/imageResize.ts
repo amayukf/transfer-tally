@@ -15,12 +15,20 @@ export interface ResizedImageResult {
   fileName: string;
 }
 
-function loadImageElement(src: string): Promise<HTMLImageElement> {
+function loadImageElement(src: string | Blob): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error('Failed to load image for OCR'));
-    img.src = src;
+    const imageUrl = typeof src === 'string' ? src : URL.createObjectURL(src);
+    const objectUrl = typeof src === 'string' ? null : imageUrl;
+    img.onload = () => {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      resolve(img);
+    };
+    img.onerror = () => {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      reject(new Error('Failed to load image for OCR'));
+    };
+    img.src = imageUrl;
   });
 }
 
@@ -30,7 +38,7 @@ const OCR_TARGET_WIDTH = 1600;
 const OCR_MAX_PIXELS = 5_000_000;
 
 /**
- * Prepares a (already resized) receipt image for on-device OCR.
+ * Prepares an original image or data URL for on-device OCR.
  *
  * Tesseract is trained on dark text over a light background, so white-on-dark
  * receipts (e.g. dark-themed banking apps) are a common source of misread
@@ -39,20 +47,20 @@ const OCR_MAX_PIXELS = 5_000_000;
  * unchanged if the browser cannot run the pixel pipeline.
  */
 export async function preprocessImageForOcr(
-  dataUrl: string,
+  source: string | Blob,
   targetWidth: number = OCR_TARGET_WIDTH
-): Promise<string> {
+): Promise<string | Blob> {
   try {
-    const img = await loadImageElement(dataUrl);
+    const img = await loadImageElement(source);
     const srcW = img.naturalWidth || img.width;
     const srcH = img.naturalHeight || img.height;
-    if (!srcW || !srcH) return dataUrl;
+    if (!srcW || !srcH) return source;
 
     let scale = Math.min(2.2, Math.max(1, targetWidth / srcW));
     if (srcW * srcH * scale * scale > OCR_MAX_PIXELS) {
       scale = Math.sqrt(OCR_MAX_PIXELS / (srcW * srcH));
     }
-    if (scale <= 0) return dataUrl;
+    if (scale <= 0) return source;
 
     const width = Math.round(srcW * scale);
     const height = Math.round(srcH * scale);
@@ -61,7 +69,7 @@ export async function preprocessImageForOcr(
     canvas.width = width;
     canvas.height = height;
     const ctx = canvas.getContext('2d');
-    if (!ctx) return dataUrl;
+    if (!ctx) return source;
 
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'high';
@@ -91,7 +99,7 @@ export async function preprocessImageForOcr(
     // PNG is lossless — the extra bytes are local-only and help the OCR.
     return canvas.toDataURL('image/png');
   } catch {
-    return dataUrl;
+    return source;
   }
 }
 

@@ -121,6 +121,9 @@ const DATE_OR_TIME_VALUE =
 
 function extractNumbers(line: string): number[] {
   const amountText = line
+    // Tesseract can split the thousands group from the final digit, e.g.
+    // "1,00 4.00" for "1,004.00". Rejoin only this recognizable pattern.
+    .replace(/\b(\d{1,3},\d{2})\s+(\d{1,3}\.\d{2})\b/g, '$1$2')
     .replace(
       /\b(?:transaction\s*(?:id|no|number)|reference(?:\s*(?:no|number|id))?|ref(?:\s*(?:no|number|id))?|txn|receipt\s*(?:no|number))\s*[:#]?\s*[A-Z0-9-]+/gi,
       ' '

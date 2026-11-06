@@ -355,7 +355,7 @@ export default function TransferTallyPage() {
         if (extractionMode !== 'ai') {
           try {
             setProcessingStatus(t('status.reading', { i: i + 1, n: validFiles.length }));
-            const ocr = await extractWithOcr(resized.dataUrl, (p) => {
+            const ocr = await extractWithOcr(file, (p) => {
               setProcessingStatus(
                 t('status.readingPct', {
                   i: i + 1,

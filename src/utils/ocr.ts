@@ -118,11 +118,11 @@ export interface OcrExtractionResult extends ParsedReceipt {
 }
 
 /**
- * Runs OCR on a (already resized) receipt image and parses the text.
+ * Runs OCR against the original local image and parses the text.
  * Throws if the OCR engine cannot be loaded (e.g. first run with no network).
  */
 export async function extractWithOcr(
-  image: string,
+  image: string | Blob,
   onProgress?: ProgressFn
 ): Promise<OcrExtractionResult> {
   const slot = await acquireSlot();

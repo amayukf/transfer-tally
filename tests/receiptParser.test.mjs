@@ -102,3 +102,21 @@ test('marks an unlabeled amount as unverified even when a reference exists', () 
   assert.equal(result.fields.confidence, 'low');
   assert.equal(result.reliable, false);
 });
+
+test('recovers a Telebirr thousands value split by OCR and keeps its labeled ID', () => {
+  const receipt = [
+    'Successful',
+    '-1,00 4.00 (ETB)',
+    'Transaction Time: 2025/08/05 12:36:18',
+    'Transaction Type: Transfer Money',
+    'Transaction To: ABERA',
+    'Transaction Number: CH500P1QLC',
+    'Receive money from abroad via telebirr',
+  ].join('\n');
+
+  const result = parseReceiptText(receipt);
+
+  assert.equal(result.fields.amount, 1004);
+  assert.equal(result.fields.reference_no, 'CH500P1QLC');
+  assert.equal(result.fields.bank, 'Telebirr');
+});
