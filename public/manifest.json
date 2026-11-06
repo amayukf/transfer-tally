@@ -1,0 +1,31 @@
+{
+  "name": "Transfer Tally - Receipt Scanner",
+  "short_name": "Transfer Tally",
+  "description": "Mobile receipt scanner and tally for Ethiopian bank transfers (Telebirr, CBE, Awash, etc.)",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#090d16",
+  "theme_color": "#0f766e",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "share_target": {
+    "action": "/share-target",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "files": [
+        {
+          "name": "images",
+          "accept": ["image/jpeg", "image/png", "image/webp", "image/*"]
+        }
+      ]
+    }
+  }
+}
