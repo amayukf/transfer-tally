@@ -1,4 +1,4 @@
-import { ConfidenceLevel, GeminiExtractionResponse } from '@/types/transfer';
+import type { ConfidenceLevel, GeminiExtractionResponse } from '@/types/transfer';
 
 /**
  * Heuristic parser that turns raw OCR text from an Ethiopian bank / mobile
@@ -42,6 +42,11 @@ const BANK_PATTERNS: Array<{ name: string; patterns: RegExp[] }> = [
 ];
 
 function detectBank(text: string): string | null {
+  // Prefer the printed issuer over a product mention such as "CBE Birr
+  // wallet" in the transaction description.
+  if (/commercial bank of ethiopia|የኢትዮጵያ\s*ንግድ\s*ባንክ/i.test(text)) {
+    return 'Commercial Bank of Ethiopia (CBE)';
+  }
   for (const bank of BANK_PATTERNS) {
     if (bank.patterns.some((re) => re.test(text))) return bank.name;
   }
@@ -107,8 +112,28 @@ const AMOUNT_EXCLUDE = [
   /\bmobile\b/i,
 ];
 
+const FEE_LABEL = /\b(?:fee|service\s+charge|charge|commission)\b|ክፍያ|አገልግሎት/i;
+const INCLUSIVE_TOTAL_LABEL =
+  /(?:\b(?:total|amount)\b.{0,32}\b(?:including|incl\.?|with)\b.{0,16}\b(?:fee|charge|commission)\b|\b(?:fee|charge|commission)\b.{0,16}\b(?:included|inclusive)\b)/i;
+const AMOUNT_METADATA_LABEL = /\b(?:date|time|transaction\s*(?:date|time|id|no|number)|reference|ref(?:erence)?|txn|receipt\s*(?:no|number))\b/i;
+const DATE_OR_TIME_VALUE =
+  /\b\d{4}[/. -]\d{1,2}[/. -]\d{1,2}\b|\b\d{1,2}:\d{2}(?::\d{2})?\b/;
+
 function extractNumbers(line: string): number[] {
-  const raw = line.match(NUMBER_RE) || [];
+  const amountText = line
+    .replace(
+      /\b(?:transaction\s*(?:id|no|number)|reference(?:\s*(?:no|number|id))?|ref(?:\s*(?:no|number|id))?|txn|receipt\s*(?:no|number))\s*[:#]?\s*[A-Z0-9-]+/gi,
+      ' '
+    )
+    .replace(/\b(?:account|phone|mobile)\s*(?:no|number)?\s*[:#]?\s*\+?[\d*().\s-]{5,}/gi, ' ')
+    .replace(/\b[A-Z]{2,4}-\d\*+\d+\b/gi, ' ')
+    .replace(/\b\d{4}[/. -]\d{1,2}[/. -]\d{1,2}\b/g, ' ')
+    .replace(
+      /\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2},?\s+\d{4}\b/gi,
+      ' '
+    )
+    .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?\b/gi, ' ');
+  const raw = amountText.match(NUMBER_RE) || [];
   const out: number[] = [];
   for (const t of raw) {
     const v = toNumber(t);
@@ -119,51 +144,114 @@ function extractNumbers(line: string): number[] {
 }
 
 function amountLabelPriority(line: string): number {
-  if (AMOUNT_LABEL_TRANSFERRED.some((re) => re.test(line))) return 4;
+  if (AMOUNT_LABEL_TRANSFERRED.some((re) => re.test(line))) return 5;
   // Checked before the generic "amount" so a fee-inclusive "Total Amount" line
   // is down-ranked below a plain "Amount" line.
-  if (AMOUNT_LABEL_TOTAL.some((re) => re.test(line))) return 2;
-  if (AMOUNT_LABEL_AMOUNT.some((re) => re.test(line))) return 3;
-  if (CURRENCY_TOKENS.some((re) => re.test(line))) return 1;
+  if (AMOUNT_LABEL_TOTAL.some((re) => re.test(line))) return 3;
+  if (AMOUNT_LABEL_AMOUNT.some((re) => re.test(line))) return 4;
+  if (CURRENCY_TOKENS.some((re) => re.test(line))) return 2;
   return 0;
 }
 
 function findAmount(lines: string[]): number | null {
-  const candidates: Array<{ value: number; priority: number }> = [];
+  const candidates: Array<{ value: number; priority: number; includesFee: boolean }> = [];
+  let explicitFeeTotal = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (INCLUSIVE_TOTAL_LABEL.test(line)) continue;
+    const feeMatch = line.match(FEE_LABEL);
+    if (!feeMatch || feeMatch.index === undefined) continue;
+
+    const feeText = line.slice(feeMatch.index + feeMatch[0].length);
+    let feeValues = extractNumbers(feeText);
+    if (feeValues.length === 0) {
+      for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
+        if (
+          AMOUNT_LABEL_TRANSFERRED.some((re) => re.test(lines[j])) ||
+          AMOUNT_LABEL_AMOUNT.some((re) => re.test(lines[j])) ||
+          AMOUNT_LABEL_TOTAL.some((re) => re.test(lines[j])) ||
+          FEE_LABEL.test(lines[j]) ||
+          AMOUNT_METADATA_LABEL.test(lines[j]) ||
+          DATE_OR_TIME_VALUE.test(lines[j])
+        ) {
+          break;
+        }
+        feeValues = extractNumbers(lines[j]);
+        if (feeValues.length > 0) break;
+      }
+    }
+    if (feeValues.length > 0) explicitFeeTotal += feeValues[0];
+  }
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     let priority = amountLabelPriority(line);
+    const feeMatch = line.match(FEE_LABEL);
+    const includesFee = INCLUSIVE_TOTAL_LABEL.test(line);
+
+    // Fee rows are never transfer amounts. An explicitly labeled amount that
+    // shares a line with its fee may still contribute the number before it.
+    if (feeMatch && !includesFee) {
+      if (feeMatch.index === undefined || priority === 0) continue;
+    }
+
+    // Dates, times, and transaction identifiers are metadata, not amounts.
+    // Do not let their numeric parts enter the unlabeled fallback candidates.
+    if (
+      priority === 0 &&
+      (AMOUNT_METADATA_LABEL.test(line) || DATE_OR_TIME_VALUE.test(line))
+    ) {
+      continue;
+    }
     let numbers = extractNumbers(line);
+    let hasNumberBeforeFee = false;
 
     // Label on this line, value on one of the next two lines (common layout).
     if (numbers.length === 0 && priority > 0) {
       for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
+        if (FEE_LABEL.test(lines[j]) || AMOUNT_EXCLUDE.some((re) => re.test(lines[j]))) {
+          break;
+        }
         const nextNumbers = extractNumbers(lines[j]);
         if (nextNumbers.length > 0) {
           numbers = nextNumbers;
           break;
         }
         // Stop if the next line is itself a different labelled figure.
-        if (amountLabelPriority(lines[j]) > 0 || AMOUNT_EXCLUDE.some((re) => re.test(lines[j]))) {
+        if (amountLabelPriority(lines[j]) > 0) {
           break;
         }
       }
     }
 
+    if (feeMatch && !includesFee && feeMatch.index !== undefined) {
+      const amountBeforeFee = extractNumbers(line.slice(0, feeMatch.index));
+      if (amountBeforeFee.length > 0) {
+        numbers = amountBeforeFee;
+        hasNumberBeforeFee = true;
+      }
+    }
+
     if (numbers.length === 0) continue;
-    // Skip fee/VAT/balance lines unless they explicitly say "transferred".
-    if (AMOUNT_EXCLUDE.some((re) => re.test(line)) && priority < 4) continue;
+    // Fee rows stay excluded; other fee-related figures (VAT, balance, etc.)
+    // are also ignored unless the line has a strong amount label.
+    if (feeMatch && !includesFee && !hasNumberBeforeFee) continue;
+    if (AMOUNT_EXCLUDE.some((re) => re.test(line)) && priority < 4 && !includesFee) continue;
     if (priority === 0) priority = 1; // bare number with no label at all
 
-    for (const value of numbers) candidates.push({ value, priority });
+    for (const value of numbers) candidates.push({ value, priority, includesFee });
   }
 
   if (candidates.length === 0) return null;
 
   // Highest-priority label wins; ties broken by the largest amount.
   candidates.sort((a, b) => b.priority - a.priority || b.value - a.value);
-  return candidates[0].value;
+  const selected = candidates[0];
+  if (!selected.includesFee) return selected.value;
+  // Subtract only a separately recognized fee from a total explicitly marked
+  // as fee-inclusive. Without both signals, leave the value for manual review.
+  return explicitFeeTotal > 0 ? Math.max(0, selected.value - explicitFeeTotal) : null;
 }
 
 /* ------------------------------------------------------------------ */
