@@ -1,4 +1,5 @@
 import { parseReceiptText, ParsedReceipt } from '@/utils/receiptParser';
+import { preprocessImageForOcr } from '@/utils/imageResize';
 
 /**
  * On-device OCR using Tesseract.js (WASM).
@@ -45,13 +46,22 @@ function createWorkerFor(slot: PoolSlot): Promise<TesseractWorker> {
   if (slot.worker) return Promise.resolve(slot.worker);
   if (!slot.init) {
     slot.init = (async () => {
-      const { createWorker } = await import('tesseract.js');
+      const { createWorker, PSM } = await import('tesseract.js');
       const worker = await createWorker('eng', 1, {
         logger: (m) => {
           if (slot.progressFn && typeof m.progress === 'number') {
             slot.progressFn(m.progress, m.status);
           }
         },
+      });
+      // A receipt is one dense text block, so keep lines intact instead of
+      // letting Tesseract re-segment them. Preserving inter-word spacing keeps
+      // "Amount 1,250.00" together on one line for the parser, and a declared
+      // DPI stops it from guessing a resolution that hurts digit accuracy.
+      await worker.setParameters({
+        tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
+        preserve_interword_spaces: '1',
+        user_defined_dpi: '300',
       });
       slot.worker = worker;
       return worker;
@@ -120,7 +130,10 @@ export async function extractWithOcr(
   slot.progressFn = onProgress ?? null;
   try {
     const worker = await createWorkerFor(slot);
-    const { data } = await worker.recognize(image);
+    // Normalise the image (grayscale, flip dark receipts, enlarge small text)
+    // so Tesseract reads digits far more reliably than from the raw screenshot.
+    const prepared = await preprocessImageForOcr(image);
+    const { data } = await worker.recognize(prepared);
     const rawText = data.text || '';
     const parsed = parseReceiptText(rawText);
     return { ...parsed, rawText, ocrConfidence: data.confidence ?? 0 };

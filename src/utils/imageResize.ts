@@ -15,6 +15,86 @@ export interface ResizedImageResult {
   fileName: string;
 }
 
+function loadImageElement(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('Failed to load image for OCR'));
+    img.src = src;
+  });
+}
+
+// OCR reads small glyphs better when they are enlarged, but mobile canvases
+// must stay bounded, so scale-up is capped by a total-pixel budget.
+const OCR_TARGET_WIDTH = 1600;
+const OCR_MAX_PIXELS = 5_000_000;
+
+/**
+ * Prepares a (already resized) receipt image for on-device OCR.
+ *
+ * Tesseract is trained on dark text over a light background, so white-on-dark
+ * receipts (e.g. dark-themed banking apps) are a common source of misread
+ * digits. This normalises the image: grayscale, invert when the shot is
+ * predominantly dark, and enlarge small text. Returns a data URL, or the input
+ * unchanged if the browser cannot run the pixel pipeline.
+ */
+export async function preprocessImageForOcr(
+  dataUrl: string,
+  targetWidth: number = OCR_TARGET_WIDTH
+): Promise<string> {
+  try {
+    const img = await loadImageElement(dataUrl);
+    const srcW = img.naturalWidth || img.width;
+    const srcH = img.naturalHeight || img.height;
+    if (!srcW || !srcH) return dataUrl;
+
+    let scale = Math.min(2.2, Math.max(1, targetWidth / srcW));
+    if (srcW * srcH * scale * scale > OCR_MAX_PIXELS) {
+      scale = Math.sqrt(OCR_MAX_PIXELS / (srcW * srcH));
+    }
+    if (scale <= 0) return dataUrl;
+
+    const width = Math.round(srcW * scale);
+    const height = Math.round(srcH * scale);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return dataUrl;
+
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, 0, 0, width, height);
+
+    const imageData = ctx.getImageData(0, 0, width, height);
+    const data = imageData.data;
+
+    // Rec.601 luma mean, so we can detect a dark background before converting.
+    const pixels = width * height;
+    let sum = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      sum += (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114) | 0;
+    }
+    const invert = sum / pixels < 128;
+
+    for (let i = 0; i < data.length; i += 4) {
+      let g = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114) | 0;
+      if (invert) g = 255 - g;
+      data[i] = g;
+      data[i + 1] = g;
+      data[i + 2] = g;
+      data[i + 3] = 255;
+    }
+    ctx.putImageData(imageData, 0, 0);
+
+    // PNG is lossless — the extra bytes are local-only and help the OCR.
+    return canvas.toDataURL('image/png');
+  } catch {
+    return dataUrl;
+  }
+}
+
 export async function resizeImageForUpload(
   file: File,
   maxDimension: number = 1400,
