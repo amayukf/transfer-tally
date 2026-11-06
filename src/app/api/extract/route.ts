@@ -1,6 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { GeminiExtractionResponse } from '@/types/transfer';
 
+// A single extraction can legitimately take several seconds (image upload +
+// Gemini vision inference), and the fallback chain may try up to 3 models on
+// a 503 spike. Without this, serverless hosts (e.g. Vercel) kill the function
+// on their plan default (as low as 10s) and the cashier sees a 504 mid-batch.
+// 60s is the maximum allowed on Vercel's Hobby plan and matches the per-model
+// AbortSignal timeout below.
+export const maxDuration = 60;
+
 const EXTRACTION_PROMPT = `Extract ONE transfer from this Ethiopian bank / mobile money receipt (English or Amharic). amount = money transferred in ETB as a plain number, NOT the service fee, VAT or remaining balance. reference_no = transaction ID exactly as printed. If the image is not a payment confirmation, set is_receipt false. Never invent values; use an empty string if a field is not visible. confidence = low if you had to guess the amount or reference number.`;
 
 const RESPONSE_SCHEMA = {
