@@ -7,6 +7,7 @@ export interface TallySummary {
   missingRefCount: number; // Count of transfers with missing reference numbers (excluded until entered)
   nonReceiptCount: number; // Count of uploads that are not payment receipts (excluded)
   lowConfidenceCount: number; // Count of transfers needing cashier review
+  unverifiedCount: number; // Counted rows the bank did not confirm
   processedTransfers: TransferRecord[];
 }
 
@@ -38,6 +39,7 @@ export function computeTallyWithDuplicates(
   let missingRefCount = 0;
   let nonReceiptCount = 0;
   let lowConfidenceCount = 0;
+  let unverifiedCount = 0;
 
   const processedTransfers: TransferRecord[] = transfers.map((item) => {
     const normRef = normalizeReference(item.reference_no);
@@ -88,6 +90,11 @@ export function computeTallyWithDuplicates(
       validCount++;
       // Strict in-code sum with floating point safety
       totalAmount = Math.round((totalAmount + (Number(item.amount) || 0)) * 100) / 100;
+      // The row still counts, but the cashier is warned that the bank did not
+      // confirm this money actually arrived (or it was entered by hand).
+      if (item.verification !== 'verified') {
+        unverifiedCount++;
+      }
     }
 
     return {
@@ -106,6 +113,7 @@ export function computeTallyWithDuplicates(
     missingRefCount,
     nonReceiptCount,
     lowConfidenceCount,
+    unverifiedCount,
     processedTransfers,
   };
 }

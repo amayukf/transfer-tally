@@ -31,6 +31,7 @@ const DICT: Record<string, Entry> = {
   'total.missingRef': { en: '{n} missing ref', am: '{n} ማጣቀሻ የለም' },
   'total.nonReceipt': { en: '{n} not a receipt', am: '{n} ደረሰኝ አይደለም' },
   'total.reviewNeeded': { en: '{n} review needed', am: '{n} እይታ ይፈልጋል' },
+  'total.unverified': { en: '{n} not bank-verified', am: '{n} በባንክ ያልተረጋገጡ' },
 
   /* Navigation tabs */
   'nav.batch': { en: 'Today\u2019s Batch', am: 'የዛሬ ስብስብ' },
@@ -48,16 +49,50 @@ const DICT: Record<string, Entry> = {
     en: 'Or share straight from your gallery: select the screenshots \u2192 Share \u2192 Transfer Tally.',
     am: 'ወይም ከጋለሪዎ በቀጥታ ያጋሩ፦ ስክሪንሾቹን ይምረጡ \u2192 Share \u2192 Transfer Tally።',
   },
-  'scanMode.label': { en: 'Scan mode', am: 'የስካን ዘዴ' },
-  'scanMode.hybrid': {
-    en: 'On-device + AI fallback (best accuracy)',
-    am: 'በመሣሪያው ላይ + AI አማራጭ (ከፍተኛ ትክክለኛነት)',
+  'upload.verifyHint': {
+    en: 'Each screenshot is checked with the bank through links.et, so the amount comes from the bank\u2019s own receipt \u2014 not from the picture.',
+    am: 'እያንዳንዱ ስክሪንሾት ከባንኩ ጋር በlinks.et ይረጋገጣል፤ ስለዚህ መጠኑ ከባንኩ ደረሰኝ ይመጣል \u2014 ከምስሉ አይደለም።',
   },
-  'scanMode.onDevice': {
-    en: 'On-device only (no AI, private)',
-    am: 'በመሣሪያው ላይ ብቻ (AI የለም፣ ሚስጥራዊ)',
+
+  /* Bank verification (links.et) */
+  'verify.verifiedBadge': { en: '\u2713 Bank verified', am: '\u2713 በባንክ ተረጋግጧል' },
+  'verify.unverifiedBadge': { en: '\u26a0\ufe0f Not verified', am: '\u26a0\ufe0f አልተረጋገጠም' },
+  'verify.verifiedBy': { en: 'Confirmed by {bank}', am: 'በ{bank} ተረጋግጧል' },
+  'verify.amountLabel': { en: 'BANK-CONFIRMED AMOUNT', am: 'በባንክ የተረጋገጠ መጠን' },
+  'verify.payerLabel': { en: 'Payer (bank record)', am: 'ከፋይ (የባንክ መዝገብ)' },
+  'verify.receiptNo': { en: 'Bank Receipt No', am: 'የባንክ ደረሰኝ ቁጥር' },
+  'verify.feeLabel': { en: 'Service Fee', am: 'የአገልግሎት ክፍያ' },
+  'verify.totalPaidLabel': { en: 'Total Debited', am: 'ጠቅላላ የተከፈለ' },
+  'verify.statusUnverified': { en: 'Not confirmed by bank', am: 'በባንክ አልተረጋገጠም' },
+  'verify.reason.unsupported_provider': {
+    en: 'This bank\u2019s screenshot cannot be checked. Ask the customer for the receipt link, then verify it.',
+    am: 'የዚህ ባንክ ስክሪንሾት ማረጋገጥ አይቻልም። ደንበኛው የደረሰኝ ሊንክ እንዲሰጥ ጠይቀው ያረጋግጡ።',
   },
-  'scanMode.ai': { en: 'AI only', am: 'AI ብቻ' },
+  'verify.reason.no_reference': {
+    en: 'No transaction number was found on this screenshot.',
+    am: 'በዚህ ስክሪንሾት ላይ የግብይት ቁጥር አልተገኘም።',
+  },
+  'verify.reason.provider_needs_full_url': {
+    en: 'This bank needs the full receipt link to confirm the payment, not just a screenshot.',
+    am: 'ይህ ባንክ ክፍያውን ለማረጋገጥ ሙሉ የደረሰኝ ሊንክ ይፈልጋል፣ ስክሪንሾት ብቻ አይበቃም።',
+  },
+  'verify.reason.upstream_failed': {
+    en: 'The bank did not answer in time. Try the same screenshot again.',
+    am: 'ባንኩ በሰዓቱ አልመለሰም። ተመሳሳዩን ስክሪንሾት እንደገና ይሞክሩ።',
+  },
+  'verify.reason.not_completed': {
+    en: 'The bank reports this transfer as failed or cancelled.',
+    am: 'ባንኩ ይህ ዝውውር እንዳልተሳካ ወይም እንደተሰረዘ ይናገራል።',
+  },
+  'verify.reason.amount_not_found': {
+    en: 'The bank receipt was found, but no amount could be read from it.',
+    am: 'የባንኩ ደረሰኝ ተገኘ፣ ግን መጠን ማንበብ አልተቻለም።',
+  },
+  'verify.reason.qr_receipt': {
+    en: 'This receipt is a QR code, which cannot be verified from a screenshot.',
+    am: 'ይህ ደረሰኝ የQR ኮድ ነው፤ ከስክሪንሾት ማረጋገጥ አይቻልም።',
+  },
+  'verify.reason.unknown': { en: 'Could not be verified by the bank.', am: 'በባንኩ ማረጋገጥ አልተቻለም።' },
 
   /* Progress */
   'progress.title': { en: 'Processing Receipts', am: 'ደረሰኞችን በማስኬድ ላይ' },
@@ -79,8 +114,8 @@ const DICT: Record<string, Entry> = {
   /* Empty states */
   'empty.batchTitle': { en: 'No transfers in current batch', am: 'በአሁኑ ስብስብ ውስጥ ዝውውር የለም' },
   'empty.batchBody': {
-    en: 'Upload or photograph your customers\u2019 transfer screenshots above. Telebirr, CBE, Awash and other Ethiopian receipts are read automatically, duplicates are excluded, and the day\u2019s total is calculated for you.',
-    am: 'ከላይ የደንበኞችዎን የዝውውር ስክሪንሾት ይጫኑ ወይም ፎቶ ያንሱ። ቴሌብር፣ CBE፣ አዋሽ እና ሌሎች የኢትዮጵያ ደረሰኞች በራስ-ሰር ይነበባሉ፣ ድግግሞሾች ይገለላሉ፣ የቀኑም ድምር ለእርስዎ ይሰላል።',
+    en: 'Upload or photograph your customers\u2019 transfer screenshots above. Each one is checked with the bank, duplicates are excluded, and the day\u2019s total is calculated for you.',
+    am: 'ከላይ የደንበኞችዎን የዝውውር ስክሪንሾት ይጫኑ ወይም ፎቶ ያንሱ። እያንዳንዱ ከባንኩ ጋር ይረጋገጣል፣ ድግግሞሾች ይገለላሉ፣ የቀኑም ድምር ለእርስዎ ይሰላል።',
   },
 
   /* Transfer card */
@@ -171,6 +206,26 @@ const DICT: Record<string, Entry> = {
     am: '{n} ምስሎች ተጨመሩ፦ {counted} ዝውውር + {nonReceipt} ደረሰኝ-ያልሆኑ ተገልለዋል።',
   },
   'toast.batchAdded': { en: 'Added {n} transfer(s) to the batch.', am: '{n} ዝውውሮች ወደ ስብስቡ ተጨመሩ።' },
+  'toast.batchChecked': {
+    en: 'Checked {n} screenshot(s): {verified} bank-verified, {unverified} not confirmed.',
+    am: '{n} ስክሪንሾቶች ተረጋግጠዋል፦ {verified} በባንክ የተረጋገጡ፣ {unverified} ያልተረጋገጡ።',
+  },
+  'toast.verified': {
+    en: '{n} screenshot(s) confirmed by the bank.',
+    am: '{n} ስክሪንሾቶች በባንኩ ተረጋግጠዋል።',
+  },
+  'toast.verifyFailed': {
+    en: 'Could not check {name}: {reason} Added it for manual entry.',
+    am: '{name} ማረጋገጥ አልቻልንም፦ {reason} በእጅ ለማስገባት ተጨምሯል።',
+  },
+  'toast.quotaExceeded': {
+    en: 'The links.et screenshot allowance is used up. Receipts verified before still re-check for free.',
+    am: 'የlinks.et የስክሪንሾት ገደብ አልቋል። ቀደም ብለው የተረጋገጡ ደረሰኞች አሁንም በነጻ ይመረመራሉ።',
+  },
+  'toast.keyMissing': {
+    en: 'The links.et API key is missing on the server. Add LINKS_ET_API_KEY to .env.local, then try again.',
+    am: 'የlinks.et API ቁልፍ በሰርቨሩ ላይ የለም። LINKS_ET_API_KEY ን በ.env.local ውስጥ ያክሉ፣ ቀጥሎ እንደገና ይሞክሩ።',
+  },
   'toast.sharedReceived': {
     en: 'Received {n} shared image(s). Scanning\u2026',
     am: '{n} የተጋሩ ምስሎች ተቀብለናል። በመስካን ላይ\u2026',
@@ -209,39 +264,27 @@ const DICT: Record<string, Entry> = {
     am: 'የ{id} የተቀመጠ መዝገብ ይጥፋ?',
   },
   'toast.dayDeleted': { en: 'Deleted {id}', am: '{id} ተጠፍቷል' },
-  'toast.readFailed': {
-    en: 'Could not read {name}: {reason} Added it for manual entry.',
-    am: '{name} ማንበብ አልቻልንም፦ {reason} በእጅ ለማስገባት ተጨምሯል።',
-  },
 
   /* Progress / status messages */
-  'status.resizing': {
-    en: 'Resizing & preparing receipt {i} of {n}\u2026',
-    am: 'ደረሰኝ {i} ከ{n} በማዘጋጀት ላይ\u2026',
+  'status.preparing': {
+    en: 'Preparing screenshot {i} of {n}\u2026',
+    am: 'ስክሪንሾት {i} ከ{n} በማዘጋጀት ላይ\u2026',
   },
-  'status.reading': {
-    en: 'Reading receipt {i} of {n} on-device\u2026',
-    am: 'ደረሰኝ {i} ከ{n} በመሣሪያው ላይ በማንበብ ላይ\u2026',
+  'status.verifying': {
+    en: 'Checking screenshot {i} of {n} with the bank\u2026',
+    am: 'ስክሪንሾት {i} ከ{n} ከባንኩ ጋር በማረጋገጥ ላይ\u2026',
   },
-  'status.readingPct': {
-    en: 'Reading receipt {i} of {n} on-device\u2026 {p}%',
-    am: 'ደረሰኝ {i} ከ{n} በመሣሪያው ላይ በማንበብ ላይ\u2026 {p}%',
-  },
-  'status.ocrUnavailable': {
-    en: 'On-device reading is unavailable (it needs internet the first time).',
-    am: 'በመሣሪያው ላይ ማንበብ አይቻልም (በመጀመሪያ ጊዜ ኢንተርኔት ይፈልጋል)።',
-  },
-  'status.scanningAi': {
-    en: 'Scanning receipt {i} of {n} with AI\u2026',
-    am: 'ደረሰኝ {i} ከ{n} በAI በመስካን ላይ\u2026',
+  'status.cachedCheck': {
+    en: 'Reusing the earlier bank check for screenshot {i} of {n}\u2026',
+    am: 'ለስክሪንሾት {i} ከ{n} ቀደም የተደረገው ማረጋገጫ በመጠቀም ላይ\u2026',
   },
   'status.retrying': {
-    en: 'Extraction service busy. Retrying in {s}s (attempt {a} of {b})\u2026',
-    am: 'አገልግሎቱ ሥራ ላይ ነው። በ{s} ሰከንድ ውስጥ ይደገማል ({a} ከ{b})\u2026',
+    en: 'Verification service busy. Retrying in {s}s (attempt {a} of {b})\u2026',
+    am: 'የማረጋገጫ አገልግሎቱ ሥራ ላይ ነው። በ{s} ሰከንድ ውስጥ ይደገማል ({a} ከ{b})\u2026',
   },
   'err.network': {
-    en: 'Network error while contacting the extraction service.',
-    am: 'ከአገልግሎቱ ጋር ሲገናኝ የኔትወርክ ስህተት ተፈጥሯል።',
+    en: 'Network error while contacting the verification service.',
+    am: 'ከማረጋገጫ አገልግሎቱ ጋር ሲገናኝ የኔትወርክ ስህተት ተፈጥሯል።',
   },
 
   /* Save-day review dialog */
@@ -260,6 +303,10 @@ const DICT: Record<string, Entry> = {
   'review.lowConfidence': {
     en: '{n} low-confidence row(s) counted',
     am: '{n} ዝቅተኛ-እርግጠኝነት ረድፎች ተቆጥረዋል',
+  },
+  'review.unverified': {
+    en: '{n} row(s) the bank did not confirm',
+    am: '{n} በባንክ ያልተረጋገጡ ረድፎች',
   },
 };
 

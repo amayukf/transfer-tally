@@ -254,6 +254,11 @@ button, input, select, textarea {
   color: #92400e;
 }
 
+.total-pill-unverified {
+  background: #ffedd5;
+  color: #9a3412;
+}
+
 /* Nav Tabs */
 .nav-tabs {
   display: flex;
@@ -423,6 +428,21 @@ button, input, select, textarea {
   flex-wrap: wrap;
   gap: 10px;
   width: 100%;
+}
+
+/* Bank-verification hint shown under the upload buttons */
+.verify-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--primary-light);
+  color: var(--primary-text);
+  font-size: 0.78rem;
+  line-height: 1.4;
+  text-align: left;
 }
 
 .extraction-mode-row {
@@ -643,6 +663,22 @@ button, input, select, textarea {
   opacity: 0.85;
 }
 
+/* Bank-verified card: a quiet teal accent, not a second alert colour */
+.transfer-card.is-verified {
+  border-color: var(--badge-high-border);
+}
+
+.transfer-card.is-verified::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 14px;
+  bottom: 14px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: #10b981;
+}
+
 .card-top-row {
   display: flex;
   justify-content: space-between;
@@ -719,6 +755,27 @@ button, input, select, textarea {
   font-weight: 800;
 }
 
+/* Bank verification badges */
+.badge-verified {
+  background: var(--badge-high-bg);
+  color: var(--badge-high-text);
+  border-color: var(--badge-high-border);
+  font-weight: 800;
+}
+
+.badge-unverified {
+  background: #ffedd5;
+  color: #9a3412;
+  border-color: #fed7aa;
+  font-weight: 800;
+}
+
+[data-theme='dark'] .badge-unverified {
+  background: #431407;
+  color: #fdba74;
+  border-color: #9a3412;
+}
+
 /* Card Amount Row */
 .card-amount-box {
   display: flex;
@@ -781,6 +838,36 @@ button, input, select, textarea {
   font-size: 0.9rem;
   font-weight: 700;
   color: var(--primary);
+}
+
+/* Verification outcome band inside a card */
+.verify-band {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 0.8rem;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.verify-band-ok {
+  background: var(--badge-high-bg);
+  color: var(--badge-high-text);
+  border: 1px solid var(--badge-high-border);
+}
+
+.verify-band-warn {
+  background: #fffbeb;
+  color: #92400e;
+  border: 1px solid #fde68a;
+}
+
+[data-theme='dark'] .verify-band-warn {
+  background: #451a03;
+  color: #fcd34d;
+  border-color: #92400e;
 }
 
 /* Card Action Buttons */

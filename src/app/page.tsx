@@ -1,12 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import {
-  TransferRecord,
-  DayRecord,
-  ConfidenceLevel,
-  GeminiExtractionResponse,
-} from '@/types/transfer';
+import { TransferRecord, DayRecord, ConfidenceLevel } from '@/types/transfer';
 import { resizeImageForUpload } from '@/utils/imageResize';
 import {
   computeTallyWithDuplicates,
@@ -18,8 +13,12 @@ import {
   saveDayRecord,
   deleteDayRecord,
   exportTransfersToCsv,
+  getVerifyCache,
+  setVerifyCacheEntry,
+  type CachedVerification,
 } from '@/utils/storage';
-import { extractWithOcr, getOcrConcurrency, prewarmOcr, terminateOcrWorker } from '@/utils/ocr';
+import { providerLabel } from '@/utils/linksEt';
+import type { VerifyApiResponse } from '@/app/api/verify/route';
 import {
   translate,
   readStoredLanguage,
@@ -28,8 +27,27 @@ import {
 } from '@/utils/i18n';
 
 const MAX_UPLOAD_FILE_SIZE = 15 * 1024 * 1024; // 15MB file cap
-const MAX_EXTRACTION_ATTEMPTS = 3; // 1 initial request + up to 2 retries
-const RETRY_BACKOFF_SECONDS = 5;
+// One initial request plus one retry: a retry usually hits links.et's cache,
+// because the first call already made the bank fetch the receipt.
+const VERIFY_MAX_ATTEMPTS = 2;
+const RETRY_BACKOFF_SECONDS = 4;
+// /api/verify is rate-limited per IP (default 20/min) and each call spends a
+// metered screenshot read, so only a few screenshots are checked at a time.
+const VERIFY_CONCURRENCY = 3;
+// links.et accepts 5MB of base64 per image.
+const MAX_VERIFY_BASE64_CHARS = 5 * 1024 * 1024;
+const VERIFY_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+
+/** links.et `upstream.reason` values this app knows how to explain. */
+const KNOWN_VERIFY_REASONS = [
+  'unsupported_provider',
+  'no_reference',
+  'provider_needs_full_url',
+  'upstream_failed',
+  'qr_receipt',
+  'not_completed',
+  'amount_not_found',
+];
 
 const ETHIOPIAN_BANKS = [
   'Telebirr',
@@ -67,85 +85,101 @@ function generateTransferId(): string {
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
-type ExtractionAttempt =
-  | { kind: 'success'; data: GeminiExtractionResponse }
-  | { kind: 'retry'; message: string; retryAfterSeconds?: number }
-  | { kind: 'fatal'; message: string };
-
-/**
- * How receipt data is read:
- * - 'on-device': local OCR only. Images are never sent to AI (free + private),
- *   and anything unreadable is left for the cashier to type.
- * - 'hybrid': local OCR first; the AI extractor is called only when OCR cannot
- *   confidently read the amount + reference.
- * - 'ai': always use the Gemini extractor (most accurate, uses quota).
- */
-type ExtractionMode = 'on-device' | 'hybrid' | 'ai';
-
-const EXTRACTION_MODE_STORAGE_KEY = 'tt_extraction_mode';
-
-function readStoredExtractionMode(): ExtractionMode {
-  if (typeof window === 'undefined') return 'on-device';
-  const raw = localStorage.getItem(EXTRACTION_MODE_STORAGE_KEY);
-  return raw === 'on-device' || raw === 'hybrid' || raw === 'ai' ? raw : 'on-device';
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(new Error(`Failed to read ${file.name}`));
+    reader.readAsDataURL(file);
+  });
 }
 
 /**
- * Performs a single extraction request and classifies the outcome so the caller
- * can decide whether retrying is worthwhile (rate limits, server faults and
- * network failures) or pointless (validation / configuration errors).
+ * Prepares the image sent to links.et. The original bytes are preferred,
+ * because the bank detector reads small digits far better than a downscaled
+ * copy; only oversized photos are re-encoded for the 5MB base64 limit.
  */
-async function requestExtraction(
+async function buildVerifyPayload(file: File): Promise<{ image: string; mimeType: string }> {
+  const dataUrl = await readFileAsDataUrl(file);
+  const originalBase64 = dataUrl.replace(/^data:[^;]+;base64,/, '');
+  const originalMime = file.type || 'image/jpeg';
+
+  if (
+    originalBase64.length <= MAX_VERIFY_BASE64_CHARS &&
+    VERIFY_MIME_TYPES.includes(originalMime)
+  ) {
+    return { image: originalBase64, mimeType: originalMime };
+  }
+
+  const resized = await resizeImageForUpload(file, 2600, 0.92);
+  return { image: resized.base64, mimeType: resized.mimeType };
+}
+
+/**
+ * Fingerprints the exact file bytes so re-scanning the same screenshot reuses
+ * the earlier result instead of spending another metered screenshot read.
+ */
+async function fingerprintFile(file: File): Promise<string> {
+  try {
+    const buffer = await file.arrayBuffer();
+    const digest = await crypto.subtle.digest('SHA-256', buffer);
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  } catch {
+    return ''; // Hashing unavailable (insecure context): always call the API.
+  }
+}
+
+type VerifyAttempt =
+  | { kind: 'outcome'; value: VerifyApiResponse }
+  | { kind: 'retry'; message: string; retryAfterSeconds?: number }
+  | { kind: 'fatal'; message: string; variant?: 'quota' | 'key' };
+
+/**
+ * Performs a single bank verification through our own /api/verify proxy (the
+ * links.et key is a server-side credential) and classifies the outcome so the
+ * caller can decide whether a retry is worthwhile.
+ */
+async function requestVerification(
   image: string,
   mimeType: string,
-  fileName: string,
   translateMessage: (key: string) => string
-): Promise<ExtractionAttempt> {
+): Promise<VerifyAttempt> {
   try {
-    const res = await fetch('/api/extract', {
+    const res = await fetch('/api/verify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image, mimeType, fileName }),
+      body: JSON.stringify({ image, mimeType }),
     });
 
     if (res.ok) {
-      return { kind: 'success', data: (await res.json()) as GeminiExtractionResponse };
+      return { kind: 'outcome', value: (await res.json()) as VerifyApiResponse };
     }
 
     const errJson = await res.json().catch(() => null);
     const message =
       errJson && typeof errJson.error === 'string'
         ? errJson.error
-        : `Extraction request failed (HTTP ${res.status}).`;
+        : `Verification failed (HTTP ${res.status}).`;
 
-    // A missing API key is a configuration problem, not a transient fault —
-    // never worth retrying (the AI fallback is optional, so this is expected
-    // when the cashier runs without a Gemini key).
-    if (errJson && errJson.missingApiKey) {
-      return { kind: 'fatal', message };
-    }
+    // Configuration and quota problems never succeed on retry.
+    if (errJson?.missingApiKey) return { kind: 'fatal', message, variant: 'key' };
+    if (errJson?.quotaExceeded) return { kind: 'fatal', message, variant: 'quota' };
 
-    // 429 (rate limit) and 5xx (transient server faults) are worth retrying.
     if (res.status === 429 || res.status >= 500) {
-      // Prefer the server's own cooldown hint so a big nightly batch paces
-      // itself instead of hammering the endpoint (and the API key quota).
       const headerSeconds = Number(res.headers.get('Retry-After'));
       const bodySeconds =
         errJson && typeof errJson.retryAfterSeconds === 'number'
           ? errJson.retryAfterSeconds
           : undefined;
       const retryAfterSeconds =
-        Number.isFinite(headerSeconds) && headerSeconds > 0
-          ? headerSeconds
-          : bodySeconds;
+        Number.isFinite(headerSeconds) && headerSeconds > 0 ? headerSeconds : bodySeconds;
       return { kind: 'retry', message, retryAfterSeconds };
     }
     return { kind: 'fatal', message };
   } catch {
-    return {
-      kind: 'retry',
-      message: translateMessage('err.network'),
-    };
+    return { kind: 'retry', message: translateMessage('err.network') };
   }
 }
 
@@ -158,9 +192,6 @@ export default function TransferTallyPage() {
 
   // UI language: 'en' | 'am'
   const [language, setLanguage] = useState<Language>('en');
-
-  // Extraction mode: on-device OCR only, OCR + AI fallback, or AI only.
-  const [extractionMode, setExtractionMode] = useState<ExtractionMode>('on-device');
 
   // Day context (defaults to local YYYY-MM-DD)
   const [selectedDate, setSelectedDate] = useState<string>('');
@@ -197,9 +228,21 @@ export default function TransferTallyPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
 
+  // Image-fingerprint → bank result, held in memory for this session and
+  // mirrored to localStorage so the same screenshot never bills twice.
+  const verifyCacheRef = useRef<Record<string, CachedVerification>>({});
+
   // Translation helper bound to the active language.
   const t = (key: string, vars?: Record<string, string | number>): string =>
     translate(language, key, vars);
+
+  /** Explains why the bank did not confirm a transfer, with a safe fallback. */
+  const verifyReasonText = (reason?: string): string =>
+    t(
+      `verify.reason.${
+        reason && KNOWN_VERIFY_REASONS.includes(reason) ? reason : 'unknown'
+      }`
+    );
 
   const refreshHistoricalData = React.useCallback(() => {
     setSavedDays(getSavedDays());
@@ -234,14 +277,13 @@ export default function TransferTallyPage() {
 
   // Initialize theme, language, today's local date, and load historical data on mount
   useEffect(() => {
-    // Start downloading the OCR engine right away: the first scan should not
-    // stall on a ~15MB download while the cashier waits.
-    prewarmOcr();
+    // Load the bank-verification cache up front so re-scanning a screenshot
+    // already checked on this device never spends another metered read.
+    verifyCacheRef.current = getVerifyCache();
 
     const timer = setTimeout(() => {
       setSelectedDate(getLocalTodayDateString());
       refreshHistoricalData();
-      setExtractionMode(readStoredExtractionMode());
 
       const savedLanguage = readStoredLanguage();
       setLanguage(savedLanguage);
@@ -264,8 +306,6 @@ export default function TransferTallyPage() {
       if (toastTimerRef.current) {
         clearTimeout(toastTimerRef.current);
       }
-      // Release the OCR worker (if one was ever started) on unmount.
-      void terminateOcrWorker();
     };
   }, [refreshHistoricalData]);
 
@@ -287,23 +327,15 @@ export default function TransferTallyPage() {
     document.documentElement.setAttribute('lang', next);
   };
 
-  const changeExtractionMode = (mode: ExtractionMode) => {
-    setExtractionMode(mode);
-    try {
-      localStorage.setItem(EXTRACTION_MODE_STORAGE_KEY, mode);
-    } catch {
-      // Ignore storage failures (private mode / quota) — mode still applies.
-    }
-  };
-
   // Recompute tally and duplicates strictly in code
   const tally = useMemo(() => {
     return computeTallyWithDuplicates(transfers, historicalRefs);
   }, [transfers, historicalRefs]);
 
   /**
-   * Batch upload and extraction with canvas resize, parallel on-device OCR and
-   * 429 retries for the optional AI fallback.
+   * Batch upload: every screenshot is checked with the bank through links.et
+   * (proxied by /api/verify) and the row is built from the bank's own receipt,
+   * never from the pixels of the image.
    */
   const processFilesSequentially = async (files: File[]) => {
     if (!files.length) return;
@@ -332,82 +364,70 @@ export default function TransferTallyPage() {
     setProgressTotal(validFiles.length);
     setProgressCurrent(0);
 
-    // Read the batch with a small pool: up to getOcrConcurrency() images are
-    // resized and OCR'd at the same time, so a night's screenshots finish in a
-    // fraction of the sequential time. Results are written back by index to
-    // preserve the order the cashier selected them in.
+    // Check the batch with a small pool: only a few screenshots are verified
+    // at once, because each one is a rate-limited, metered links.et call.
+    // Results are written back by index to preserve the order the cashier
+    // selected them in.
     const newExtractedTransfers: TransferRecord[] = new Array(validFiles.length);
     let nextIndex = 0;
     let completed = 0;
 
     const processOne = async (i: number): Promise<void> => {
       const file = validFiles[i];
-      setProcessingStatus(t('status.resizing', { i: i + 1, n: validFiles.length }));
+      setProcessingStatus(t('status.preparing', { i: i + 1, n: validFiles.length }));
 
       try {
-        // 1. Client-side canvas resize (max 1400px, JPEG 0.85)
-        const resized = await resizeImageForUpload(file, 1400, 0.85);
+        // 1. Small local copy used only for the cashier's preview thumbnail.
+        const preview = await resizeImageForUpload(file, 1000, 0.8);
+        const fingerprint = await fingerprintFile(file);
 
-        let result: GeminiExtractionResponse | null = null;
+        let outcome: VerifyApiResponse | null = null;
+        let failureMessage = '';
+        let failureVariant: 'quota' | 'key' | undefined;
 
-        // 2. On-device OCR first: free, private and quota-free. Skipped only in
-        //    AI-only mode. The image is read locally and never uploaded here.
-        if (extractionMode !== 'ai') {
-          try {
-            setProcessingStatus(t('status.reading', { i: i + 1, n: validFiles.length }));
-            const ocr = await extractWithOcr(file, (p) => {
-              setProcessingStatus(
-                t('status.readingPct', {
-                  i: i + 1,
-                  n: validFiles.length,
-                  p: Math.round(p * 100),
-                })
-              );
-            });
-            // Keep the on-device read when it clearly found amount + reference,
-            // or when the cashier chose never to send images to AI.
-            if (ocr.reliable || extractionMode === 'on-device') {
-              result = ocr.fields;
+        // 2. The same screenshot checked before on this device is reused: the
+        //    bank's answer cannot change for the same picture, and a cached
+        //    result costs nothing.
+        const cached = fingerprint ? verifyCacheRef.current[fingerprint] : undefined;
+        if (cached) {
+          setProcessingStatus(t('status.cachedCheck', { i: i + 1, n: validFiles.length }));
+          outcome =
+            cached.outcome === 'verified' && cached.receipt
+              ? { ok: true, status: 'verified', receipt: cached.receipt }
+              : {
+                  ok: true,
+                  status: 'unverified',
+                  reason: cached.reason || 'unsupported_provider',
+                  provider: cached.provider,
+                  reference: cached.reference,
+                };
+        } else {
+          const payload = await buildVerifyPayload(file);
+
+          for (let attempt = 1; attempt <= VERIFY_MAX_ATTEMPTS; attempt++) {
+            setProcessingStatus(t('status.verifying', { i: i + 1, n: validFiles.length }));
+
+            const result = await requestVerification(payload.image, payload.mimeType, t);
+            if (result.kind === 'outcome') {
+              outcome = result.value;
+              break;
             }
-          } catch (ocrErr) {
-            console.warn(`On-device OCR failed for ${file.name}:`, ocrErr);
-            if (extractionMode === 'on-device') {
-              throw new Error(t('status.ocrUnavailable'));
+            if (result.kind === 'fatal') {
+              failureMessage = result.message;
+              failureVariant = result.variant;
+              break;
             }
-            // hybrid mode: fall through to the AI extractor below.
-          }
-        }
-
-        // 3. AI fallback: used in AI-only mode, and in hybrid mode when the
-        //    on-device read was not confident. Never used in on-device mode.
-        if (!result) {
-          for (let attempt = 1; attempt <= MAX_EXTRACTION_ATTEMPTS; attempt++) {
-            setProcessingStatus(
-              t('status.scanningAi', { i: i + 1, n: validFiles.length })
-            );
-
-            const outcome = await requestExtraction(
-              resized.base64,
-              resized.mimeType,
-              file.name,
-              t
-            );
-
-            if (outcome.kind === 'success') {
-              result = outcome.data;
+            if (attempt >= VERIFY_MAX_ATTEMPTS) {
+              failureMessage = result.message;
               break;
             }
 
-            // Validation / configuration errors will never succeed on retry.
-            if (outcome.kind === 'fatal' || attempt >= MAX_EXTRACTION_ATTEMPTS) {
-              throw new Error(outcome.message);
-            }
-
-            // Wait as long as the server asked (rate-limit cooldown), bounded so a
-            // large nightly batch never stalls too long on a single image.
+            // Wait as long as the server asked, bounded so a large batch never
+            // stalls on a single screenshot. A retry usually hits links.et's
+            // cache, because the first call already made the bank fetch it.
             const waitSeconds = Math.min(
-              Math.max(outcome.retryAfterSeconds ?? RETRY_BACKOFF_SECONDS, 2),
-              30
+              Math.max(result.retryAfterSeconds ?? RETRY_BACKOFF_SECONDS, 2),
+              20
             );
             setRetryAttempt(attempt);
             for (let sec = waitSeconds; sec > 0; sec--) {
@@ -415,7 +435,7 @@ export default function TransferTallyPage() {
                 t('status.retrying', {
                   s: sec,
                   a: attempt + 1,
-                  b: MAX_EXTRACTION_ATTEMPTS,
+                  b: VERIFY_MAX_ATTEMPTS,
                 })
               );
               await sleep(1000);
@@ -423,49 +443,113 @@ export default function TransferTallyPage() {
             setRetryAttempt(null);
           }
         }
+        setRetryAttempt(null);
 
-        // 4. Create transfer record with crypto ID
-        const record: TransferRecord = {
-          id: generateTransferId(),
-          bank: result?.bank || '',
-          amount: typeof result?.amount === 'number' ? result.amount : 0,
-          sender_name: result?.sender_name || '',
-          receiver_name: result?.receiver_name || '',
-          date_time: result?.date_time || new Date().toLocaleString(),
-          reference_no: result?.reference_no || '',
-          confidence: (result?.confidence as ConfidenceLevel) || 'low',
-          is_receipt: result?.is_receipt !== false,
-          image_preview: resized.dataUrl,
-          file_name: file.name,
-          created_at: new Date().toISOString(),
-        };
+        if (!outcome) {
+          throw Object.assign(new Error(failureMessage || t('err.network')), {
+            variant: failureVariant,
+          });
+        }
 
-        newExtractedTransfers[i] = record;
+        // 3. Park the bank's answer against the image fingerprint.
+        if (fingerprint) {
+          const entry: CachedVerification =
+            outcome.status === 'verified'
+              ? {
+                  outcome: 'verified',
+                  receipt: outcome.receipt,
+                  saved_at: new Date().toISOString(),
+                }
+              : {
+                  outcome: 'unverified',
+                  reason: outcome.reason,
+                  provider: outcome.provider,
+                  reference: outcome.reference,
+                  saved_at: new Date().toISOString(),
+                };
+          verifyCacheRef.current[fingerprint] = entry;
+          setVerifyCacheEntry(fingerprint, entry);
+        }
+
+        if (outcome.status === 'verified') {
+          // 4a. The row IS the bank's receipt — amount, payer and time all come
+          //     from the bank, so a doctored screenshot cannot get through.
+          const r = outcome.receipt;
+          newExtractedTransfers[i] = {
+            id: generateTransferId(),
+            bank: providerLabel(r.provider) || r.provider || t('card.unknownBank'),
+            amount: r.amount,
+            sender_name: r.payer_name,
+            receiver_name: r.receiver_name,
+            date_time: r.paid_at || new Date().toLocaleString(),
+            reference_no: r.reference,
+            confidence: 'high',
+            is_receipt: true,
+            verification: 'verified',
+            verified_receipt: r,
+            image_preview: preview.dataUrl,
+            file_name: file.name,
+            created_at: new Date().toISOString(),
+          };
+        } else {
+          // 4b. Not confirmed. The cashier types the amount and reference by
+          //     hand; the row stays flagged as unverified.
+          newExtractedTransfers[i] = {
+            id: generateTransferId(),
+            bank: providerLabel(outcome.provider) || '',
+            amount: 0,
+            sender_name: '',
+            receiver_name: '',
+            date_time: new Date().toLocaleString(),
+            reference_no: outcome.reference || '',
+            confidence: 'low',
+            is_receipt: true,
+            verification: 'unverified',
+            verification_note: outcome.reason,
+            image_preview: preview.dataUrl,
+            file_name: file.name,
+            created_at: new Date().toISOString(),
+          };
+        }
       } catch (err: unknown) {
-        console.error(`Error processing ${file.name}:`, err);
+        console.error(`Error verifying ${file.name}:`, err);
         const reason = err instanceof Error ? err.message : 'unknown error';
-        // Add card with low confidence so cashier can enter data manually
+        const variant =
+          err && typeof err === 'object' && 'variant' in err
+            ? (err as { variant?: 'quota' | 'key' }).variant
+            : undefined;
+
+        if (variant === 'quota') {
+          showToast(t('toast.quotaExceeded'));
+        } else if (variant === 'key') {
+          showToast(t('toast.keyMissing'));
+        } else {
+          showToast(t('toast.verifyFailed', { name: file.name, reason }));
+        }
+
+        // Keep the card so the cashier can still enter the transfer by hand.
         newExtractedTransfers[i] = {
           id: generateTransferId(),
-          bank: t('card.unknownBank'),
+          bank: '',
           amount: 0,
           sender_name: '',
           receiver_name: '',
           date_time: new Date().toLocaleString(),
           reference_no: '',
           confidence: 'low',
-          is_receipt: false,
+          is_receipt: true,
+          verification: 'unverified',
+          verification_note: 'upstream_failed',
           file_name: file.name,
           created_at: new Date().toISOString(),
         };
-        showToast(t('toast.readFailed', { name: file.name, reason }));
       } finally {
         completed++;
         setProgressCurrent(completed);
       }
     };
 
-    const concurrency = Math.min(getOcrConcurrency(), validFiles.length);
+    const concurrency = Math.min(VERIFY_CONCURRENCY, validFiles.length);
     await Promise.all(
       Array.from({ length: concurrency }, async () => {
         while (true) {
@@ -490,20 +574,20 @@ export default function TransferTallyPage() {
     if (cameraInputRef.current) cameraInputRef.current.value = '';
 
     // Summarize the batch result in one toast
-    const nonReceiptInBatch = newExtractedTransfers.filter(
-      (transfer) => transfer.is_receipt === false
+    const verifiedInBatch = newExtractedTransfers.filter(
+      (transfer) => transfer.verification === 'verified'
     ).length;
-    const counted = newExtractedTransfers.length - nonReceiptInBatch;
-    if (nonReceiptInBatch > 0) {
+    const unverifiedInBatch = newExtractedTransfers.length - verifiedInBatch;
+    if (unverifiedInBatch > 0) {
       showToast(
-        t('toast.batchSummary', {
+        t('toast.batchChecked', {
           n: newExtractedTransfers.length,
-          counted,
-          nonReceipt: nonReceiptInBatch,
+          verified: verifiedInBatch,
+          unverified: unverifiedInBatch,
         })
       );
     } else {
-      showToast(t('toast.batchAdded', { n: counted }));
+      showToast(t('toast.verified', { n: verifiedInBatch }));
     }
   };
 
@@ -772,6 +856,11 @@ export default function TransferTallyPage() {
                 🚫 {t('total.nonReceipt', { n: tally.nonReceiptCount })}
               </span>
             )}
+            {tally.unverifiedCount > 0 && (
+              <span className="total-pill total-pill-unverified">
+                🛡️ {t('total.unverified', { n: tally.unverifiedCount })}
+              </span>
+            )}
             {tally.lowConfidenceCount > 0 && (
               <span className="total-pill total-pill-review">
                 🔍 {t('total.reviewNeeded', { n: tally.lowConfidenceCount })}
@@ -843,20 +932,9 @@ export default function TransferTallyPage() {
 
               <p className="upload-hint">{t('upload.shareHint')}</p>
 
-              <div className="extraction-mode-row">
-                <label htmlFor="extraction-mode">{t('scanMode.label')}</label>
-                <select
-                  id="extraction-mode"
-                  value={extractionMode}
-                  onChange={(e) =>
-                    changeExtractionMode(e.target.value as ExtractionMode)
-                  }
-                  disabled={isProcessing}
-                >
-                  <option value="on-device">{t('scanMode.onDevice')}</option>
-                  <option value="hybrid">{t('scanMode.hybrid')}</option>
-                  <option value="ai">{t('scanMode.ai')}</option>
-                </select>
+              <div className="verify-note">
+                <span aria-hidden="true">🛡️</span>
+                <span>{t('upload.verifyHint')}</span>
               </div>
             </section>
 
@@ -934,13 +1012,17 @@ export default function TransferTallyPage() {
                   const isLowConfidence = item.confidence === 'low';
                   const isDuplicate = Boolean(item.is_duplicate);
                   const isMissingRef = Boolean(item.missing_reference);
+                  const isVerified = item.verification === 'verified';
+                  const isUnverified = item.verification === 'unverified';
 
                   return (
                     <article
                       key={item.id}
                       className={`transfer-card ${
                         isLowConfidence ? 'low-confidence' : ''
-                      } ${isDuplicate ? 'is-duplicate' : ''}`}
+                      } ${isDuplicate ? 'is-duplicate' : ''} ${
+                        isVerified ? 'is-verified' : ''
+                      }`}
                       id={`card-${item.id}`}
                     >
                       {/* Top Row: Bank Info & Badges */}
@@ -966,6 +1048,14 @@ export default function TransferTallyPage() {
                             <span className="badge badge-low">{t('badge.notReceipt')}</span>
                           ) : isMissingRef ? (
                             <span className="badge badge-low">{t('badge.needsRef')}</span>
+                          ) : isVerified ? (
+                            <span className="badge badge-verified">
+                              {t('verify.verifiedBadge')}
+                            </span>
+                          ) : isUnverified ? (
+                            <span className="badge badge-unverified">
+                              {t('verify.unverifiedBadge')}
+                            </span>
                           ) : (
                             <span
                               className={`badge ${
@@ -986,22 +1076,42 @@ export default function TransferTallyPage() {
                         </div>
                       </div>
 
-                      {/* Amount Container */}
+                      {/* Amount Container — the bank's own figure once verified */}
                       <div className="card-amount-box">
-                        <span className="amount-currency">{t('card.amount')}</span>
+                        <span className="amount-currency">
+                          {isVerified ? t('verify.amountLabel') : t('card.amount')}
+                        </span>
                         <span className="amount-value">{formatETB(item.amount)}</span>
                       </div>
+
+                      {/* Bank verification outcome */}
+                      {isVerified && (
+                        <div className="verify-band verify-band-ok">
+                          <span aria-hidden="true">🛡️</span>
+                          <span>{t('verify.verifiedBy', { bank: item.bank })}</span>
+                        </div>
+                      )}
+                      {isUnverified && (
+                        <div className="verify-band verify-band-warn">
+                          <span aria-hidden="true">⚠️</span>
+                          <span>{verifyReasonText(item.verification_note)}</span>
+                        </div>
+                      )}
 
                       {/* Details Grid */}
                       <div className="details-grid">
                         <div className="detail-item">
-                          <span className="detail-label">{t('card.reference')}</span>
+                          <span className="detail-label">
+                            {isVerified ? t('verify.receiptNo') : t('card.reference')}
+                          </span>
                           <span className="detail-value detail-ref">
                             {item.reference_no || t('card.emptyRef')}
                           </span>
                         </div>
                         <div className="detail-item">
-                          <span className="detail-label">{t('card.sender')}</span>
+                          <span className="detail-label">
+                            {isVerified ? t('verify.payerLabel') : t('card.sender')}
+                          </span>
                           <span className="detail-value">
                             {item.sender_name || '—'}
                           </span>
@@ -1015,11 +1125,29 @@ export default function TransferTallyPage() {
                         <div className="detail-item">
                           <span className="detail-label">{t('card.status')}</span>
                           <span className="detail-value">
-                            {item.is_receipt
-                              ? t('card.confirmed')
+                            {isVerified
+                              ? item.verified_receipt?.status || t('card.confirmed')
+                              : isUnverified
+                              ? t('verify.statusUnverified')
                               : t('card.notReceiptExcluded')}
                           </span>
                         </div>
+                        {isVerified && item.verified_receipt?.fee !== undefined && (
+                          <div className="detail-item">
+                            <span className="detail-label">{t('verify.feeLabel')}</span>
+                            <span className="detail-value">
+                              {t('currency')} {formatETB(item.verified_receipt.fee)}
+                            </span>
+                          </div>
+                        )}
+                        {isVerified && item.verified_receipt?.total_paid !== undefined && (
+                          <div className="detail-item">
+                            <span className="detail-label">{t('verify.totalPaidLabel')}</span>
+                            <span className="detail-value">
+                              {t('currency')} {formatETB(item.verified_receipt.total_paid)}
+                            </span>
+                          </div>
+                        )}
                       </div>
 
                       {/* Footer Actions */}

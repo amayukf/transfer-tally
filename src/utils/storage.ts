@@ -1,6 +1,8 @@
-import { DayRecord, TransferRecord, SaveDayResult } from '@/types/transfer';
+import { DayRecord, TransferRecord, SaveDayResult, VerifiedReceipt } from '@/types/transfer';
 
 const STORAGE_KEY = 'days';
+const VERIFY_CACHE_KEY = 'tt_verify_cache';
+const VERIFY_CACHE_LIMIT = 300; // ~a few weeks of receipts; oldest entries are dropped first
 const MAX_STORAGE_BYTES = 4.5 * 1024 * 1024; // 4.5MB threshold to prevent localStorage quota exhaustion
 
 /**
@@ -143,6 +145,52 @@ export function deleteDayRecord(dayId: string): boolean {
   }
 }
 
+/** A verification result parked by image fingerprint so a re-scan costs nothing. */
+export interface CachedVerification {
+  outcome: 'verified' | 'unverified';
+  reason?: string;
+  receipt?: VerifiedReceipt;
+  provider?: string;
+  reference?: string;
+  saved_at: string;
+}
+
+/** Reads the image-fingerprint → verification cache. */
+export function getVerifyCache(): Record<string, CachedVerification> {
+  if (typeof window === 'undefined') return {};
+  try {
+    const raw = localStorage.getItem(VERIFY_CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, CachedVerification>) : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Stores a verification result. Screenshot reads are metered, so the same
+ * image scanned twice (customer re-sends it, cashier reloads a page) must not
+ * be billed twice.
+ */
+export function setVerifyCacheEntry(fingerprint: string, value: CachedVerification): void {
+  if (typeof window === 'undefined' || !fingerprint) return;
+  try {
+    const cache = getVerifyCache();
+    cache[fingerprint] = value;
+    const keys = Object.keys(cache);
+    if (keys.length > VERIFY_CACHE_LIMIT) {
+      keys
+        .sort((a, b) => (cache[a].saved_at || '').localeCompare(cache[b].saved_at || ''))
+        .slice(0, keys.length - VERIFY_CACHE_LIMIT)
+        .forEach((stale) => delete cache[stale]);
+    }
+    localStorage.setItem(VERIFY_CACHE_KEY, JSON.stringify(cache));
+  } catch {
+    // Cache is best-effort: a full quota must never block the scan itself.
+  }
+}
+
 /**
  * Sanitizes CSV field against formula injection (=, +, -, @, tab, CR)
  * and escapes double quotes.
@@ -175,6 +223,7 @@ export function exportTransfersToCsv(
     'Receiver Name',
     'Reference No',
     'Confidence',
+    'Bank Verified',
     'Status',
   ];
 
@@ -188,6 +237,8 @@ export function exportTransfersToCsv(
       status = 'Missing Ref (Excluded)';
     }
 
+    const verified = t.verification === 'verified' ? 'Verified' : 'Not verified';
+
     return [
       sanitizeCsvCell(t.date_time),
       sanitizeCsvCell(t.bank),
@@ -196,6 +247,7 @@ export function exportTransfersToCsv(
       sanitizeCsvCell(t.receiver_name),
       sanitizeCsvCell(t.reference_no),
       sanitizeCsvCell(t.confidence),
+      sanitizeCsvCell(verified),
       sanitizeCsvCell(status),
     ];
   });
